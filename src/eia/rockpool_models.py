@@ -108,9 +108,16 @@ def build_xylo_snn(n_hidden: int = 63, n_out: int = 2, dt: float = 1e-3):
     # ECG (7.7% minority class), 5 restarts x 15 epochs all converged to the
     # exact majority-baseline accuracy (0.923) — worse imbalance than the
     # ~30-38% minority classes this net does learn on (synthetic ECG/PPG,
-    # BIDMC PPG). More restarts alone didn't fix it; a harder-imbalance-aware
-    # fix (class-weighted loss, oversampling) is the next thing to try if this
-    # modality needs a non-degenerate real-data number.
+    # BIDMC PPG). More restarts alone didn't fix it.
+    # FIXED in scripts/xylo_verify.py: inverse-frequency class-weighted CE
+    # (nn.CrossEntropyLoss(weight=...)) plus checkpoint selection by balanced
+    # accuracy instead of raw accuracy (raw accuracy can't tell a
+    # majority-collapsed checkpoint from a real one once one class is this
+    # rare). Real MIT-BIH now reaches float per-class recall [0.90, 0.79]
+    # (balanced acc 0.845) instead of [1.00, 0.00]. This exposed a real
+    # XyloSim fidelity gap that raw accuracy had been masking (agreement was
+    # a trivial 1.000 on the degenerate model, 0.560 on the genuine one) —
+    # see the window notes below for the one lever tried against it so far.
     #
     # LIFBitshiftTorch (not plain LIFTorch): Xylo doesn't have a continuous
     # exponential decay, it approximates it with a bit-shift ("dash"); this
@@ -120,6 +127,29 @@ def build_xylo_snn(n_hidden: int = 63, n_out: int = 2, dt: float = 1e-3):
     # float-vs-XyloSim agreement after quantization — the "quantization drop"
     # this module exists to prevent (train against the constraint, not more
     # epochs against the wrong one).
+    #
+    # ECG's quantization gap is worse than PPG's (synthetic ECG: 0.986 float
+    # -> 0.637 XyloSim, vs. PPG's 0.877 agreement) — hypothesis was that ECG's
+    # longer window (187 samples/timesteps vs. PPG's 125) gives bit-shift
+    # decay drift more time to accumulate. A/B'd via `--window` on synthetic
+    # ECG (same class-weighted training, 5 restarts x 40 epochs):
+    #   window=187 (default) : float 0.992, XyloSim agree 0.733
+    #   window=125            : float 0.996, XyloSim agree 0.707
+    #   window=90              : float 0.988, XyloSim agree 0.763  <- best
+    #   window=60              : float 0.962, XyloSim agree 0.597
+    # Non-monotonic: too long lets drift accumulate, too short (60) starves
+    # the net of enough integration time to hold a robust decision — 90 is a
+    # sweet spot, not "shorter is always better". Confirmed this does NOT
+    # transfer to real MIT-BIH as-is: at window=90, real-ECG agreement got
+    # *worse* (0.560 at window=187 -> 0.477 at window=90). Likely cause: real
+    # MIT-BIH is sampled at 360 Hz vs. the synthetic generator's 125 Hz, so
+    # the same sample count is a very different real-world duration in each
+    # (90 samples = 250ms real vs. 720ms synthetic) — "shorter window" as a
+    # timestep-count lever doesn't carry across datasets with different `fs`
+    # without rescaling by it. Left real MIT-BIH at the default window=187;
+    # `--window` stays available for further probing (e.g. try ~250-260
+    # samples on real data, matching synthetic's window=90 in wall-clock time
+    # via the fs ratio) but that's future work, not done here.
     #
     # NOT using spike_generation_fn=PeriodicExponential: the official Xylo
     # training tutorial recommends it (it's tuned for its own audio task —

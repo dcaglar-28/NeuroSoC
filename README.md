@@ -98,6 +98,7 @@ python scripts/xylo_verify.py --modality ecg --real    # just ECG, real MIT-BIH 
 python scripts/xylo_verify.py --real                   # both, real MIT-BIH + BIDMC
 python scripts/xylo_verify.py --real --require-real    # fail loudly, don't fall back, if real data can't load
 python scripts/xylo_verify.py --no-combined            # skip the Part C one-chip check
+python scripts/xylo_verify.py --modality ecg --window 90  # override the encoded window/timestep count
 ```
 
 For each modality: a data card, then float-model accuracy, XyloSim accuracy,
@@ -107,6 +108,16 @@ a **one-chip composition line** (`xylo_budget.fits_one_chip`) and a
 **co-residence check** — combines the two independently-trained nets onto one
 Xylo core (block-diagonal weights, single shared quantization) and confirms
 each modality's decisions still agree with its own standalone float model.
+
+Training uses class-weighted cross-entropy and selects checkpoints by
+**balanced accuracy**, not raw accuracy — on real MIT-BIH's 92.3%/7.7% split,
+raw accuracy can't distinguish a majority-collapsed model from a genuine one.
+The report prints both accuracy and balanced accuracy, plus **per-class
+recall**, for the float model and XyloSim separately, so a degenerate model
+can't hide behind a high headline number. See `rockpool_models.build_xylo_snn`
+for the full writeup, including why a shorter encoding window helps synthetic
+ECG's XyloSim fidelity but does *not* transfer as-is to real MIT-BIH (different
+sampling rate — same window length is a different real-world duration).
 
 See `docs/xylo_verification_task.md` and `docs/per_modality_xylo_verify_task.md`
 for the full specs and known gotchas — this exact readout (2 output neurons,

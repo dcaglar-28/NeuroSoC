@@ -49,25 +49,69 @@ def _encode_batch(X: np.ndarray, threshold: float) -> np.ndarray:
     return out
 
 
-def _eval(net, R, y_t):
+def per_class_recall(preds, y_t, n_classes: int) -> list:
+    """Recall for each class: fraction of that class's true examples the
+    model got right. Plain accuracy hides imbalance (a model that always
+    predicts the majority class scores high accuracy but 0 recall on the
+    minority) — recall per class is what actually shows that."""
+    recalls = []
+    for c in range(n_classes):
+        mask = y_t == c
+        n_c = int(mask.sum().item())
+        recalls.append(float((preds[mask] == c).float().mean().item()) if n_c else float("nan"))
+    return recalls
+
+
+def balanced_accuracy(preds, y_t, n_classes: int) -> float:
+    """Mean per-class recall — the standard imbalance-robust accuracy metric.
+    Unlike raw accuracy, a majority-only classifier scores ~1/n_classes here,
+    not ~0.92 on a 92/8 split."""
+    recalls = [r for r in per_class_recall(preds, y_t, n_classes) if not np.isnan(r)]
+    return float(np.mean(recalls)) if recalls else 0.0
+
+
+def _class_weights(y_t, n_classes: int) -> torch.Tensor:
+    """Inverse-frequency class weights for CrossEntropyLoss, computed from the
+    training split. A majority class at 92.3% otherwise dominates the
+    (unweighted) gradient enough that this net's checkpoints never escape the
+    majority-baseline solution — confirmed empirically on real MIT-BIH (5
+    restarts x 15 epochs, always exactly 0.923 = the base rate)."""
+    counts = torch.bincount(y_t, minlength=n_classes).float().clamp(min=1)
+    weight = counts.sum() / (n_classes * counts)
+    return weight
+
+
+def _eval(net, R, y_t, n_classes: int):
     net.reset_state()
     with torch.no_grad():
         out, _state, rec = net(R, record=True)
     preds = out.sum(dim=1).argmax(dim=1)
     acc = (preds == y_t).float().mean().item()
-    return acc, rec[_HIDDEN_KEY]["spikes"].mean().item(), preds
+    bal_acc = balanced_accuracy(preds, y_t, n_classes)
+    recalls = per_class_recall(preds, y_t, n_classes)
+    return acc, bal_acc, recalls, rec[_HIDDEN_KEY]["spikes"].mean().item(), preds
 
 
 def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
                     threshold: float, batch_size: int, lr: float,
                     spike_reg: float, seed: int, n_restarts: int,
-                    require_real: bool = False):
+                    require_real: bool = False, loader_kwargs: dict | None = None):
     """Part A (train half): data card + multi-restart training with
-    val-accuracy checkpoint selection (see build_xylo_snn for why this net
-    needs restarts). Returns the trained net plus held-out tensors, reused
-    both for this modality's own XyloSim check and Part C's combined check.
+    balanced-accuracy checkpoint selection (see build_xylo_snn for why this
+    net needs restarts). Returns the trained net plus held-out tensors,
+    reused both for this modality's own XyloSim check and Part C's combined
+    check.
+
+    Loss is class-weighted (inverse training-split frequency) and checkpoints
+    are selected by balanced accuracy, not raw accuracy: on real MIT-BIH ECG
+    (92.3% majority class), unweighted CE + raw-accuracy selection converged
+    to the exact majority-baseline accuracy every single restart (5 restarts
+    x 15 epochs) — raw accuracy can't tell a majority-collapsed solution from
+    a genuinely discriminative one when one class is this rare, so neither
+    the loss nor the selection metric can be allowed to only look at it.
     """
-    data = _LOADERS[modality](prefer_real=real, require_real=require_real)
+    data = _LOADERS[modality](prefer_real=real, require_real=require_real,
+                               **(loader_kwargs or {}))
     card = report.data_card(data)
     # Guards the exact bug this repo hit once already: a data object loaded
     # for one modality silently fed to training/reporting for another (see
@@ -90,9 +134,11 @@ def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
     print(f"[encoding] {modality}: mean input event rate = "
           f"{float((Rtr != 0).float().mean()):.3f}")
 
-    lossfn = nn.CrossEntropyLoss()
+    class_weight = _class_weights(ytr_t, n_classes)
+    print(f"[train] {modality}: class weights = {class_weight.tolist()}")
+    lossfn = nn.CrossEntropyLoss(weight=class_weight)
     n = Rtr.shape[0]
-    best_val_acc, best_state = -1.0, None
+    best_val_bal_acc, best_state = -1.0, None
     for restart in range(n_restarts):
         torch.manual_seed(seed * 100 + restart)
         net = rm.build_xylo_snn(n_hidden=n_hidden, n_out=n_classes)
@@ -112,18 +158,19 @@ def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
                 loss = lossfn(logits, ytr_t[bidx]) + spike_reg * spk_rate
                 loss.backward()
                 opt.step()
-            val_acc, _, _ = _eval(net, Rval, yval_t)
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
+            _val_acc, val_bal_acc, _val_recalls, _, _ = _eval(net, Rval, yval_t, n_classes)
+            if val_bal_acc > best_val_bal_acc:
+                best_val_bal_acc = val_bal_acc
                 best_state = copy.deepcopy(net.state_dict())
         print(f"[train] {modality} restart {restart}: "
-              f"best-so-far val accuracy = {best_val_acc:.3f}")
+              f"best-so-far val balanced accuracy = {best_val_bal_acc:.3f}")
 
     net = rm.build_xylo_snn(n_hidden=n_hidden, n_out=n_classes)
     net.load_state_dict(best_state)
-    print(f"[train] {modality}: final best val accuracy = {best_val_acc:.3f}")
+    print(f"[train] {modality}: final best val balanced accuracy = {best_val_bal_acc:.3f}")
 
-    float_acc, mean_hidden_rate, float_preds = _eval(net, Rte, yte_t)
+    float_acc, float_bal_acc, float_recalls, mean_hidden_rate, float_preds = \
+        _eval(net, Rte, yte_t, n_classes)
     spec = rm.map_and_quantize(net)
     _config, is_valid, msg = rm._xylo_support().config_from_specification(**spec)
     print(f"[xylo] {modality}: config_from_specification is_valid={is_valid} ({msg})")
@@ -134,7 +181,8 @@ def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
         "n_samples": int(data.X.shape[0]), "provenance": card.provenance,
         "requested_real": bool(data.requested_real),
         "Rte": Rte, "yte_t": yte_t, "float_preds": float_preds,
-        "float_acc": float_acc, "mean_hidden_rate": mean_hidden_rate,
+        "float_acc": float_acc, "float_bal_acc": float_bal_acc,
+        "float_recalls": float_recalls, "mean_hidden_rate": mean_hidden_rate,
         "is_valid": is_valid,
     }
 
@@ -149,14 +197,19 @@ def verify_modality(result: dict, max_verify: int) -> dict:
     diverge from it. This function only reports; it doesn't re-fetch data.
     """
     net, spec, Rte, yte_t = result["net"], result["spec"], result["Rte"], result["yte_t"]
+    n_classes = result["n_out"]
     n_verify = min(max_verify, Rte.shape[0])
-    matches, xylo_correct = 0, 0
+    matches = 0
+    xylo_preds = torch.empty(n_verify, dtype=torch.long)
     for i in range(n_verify):
         res = rm.verify_against_sim(net, spec, Rte[i].numpy())
         matches += int(res["match"])
-        xylo_correct += int(res["pred_xylo"] == int(yte_t[i]))
+        xylo_preds[i] = res["pred_xylo"]
+    yte_slice = yte_t[:n_verify]
+    xylo_acc = (xylo_preds == yte_slice).float().mean().item()
+    xylo_bal_acc = balanced_accuracy(xylo_preds, yte_slice, n_classes)
+    xylo_recalls = per_class_recall(xylo_preds, yte_slice, n_classes)
     agreement_rate = matches / n_verify
-    xylo_acc = xylo_correct / n_verify
 
     modality, source = result["modality"], result["source"]
     header = f" XYLO VERIFICATION -- {modality.upper()} ({source}) "
@@ -165,13 +218,18 @@ def verify_modality(result: dict, max_verify: int) -> dict:
     print(f"Provenance               : {result['provenance']}")
     print(f"Total samples (dataset)  : {result['n_samples']}")
     print(f"Held-out windows verified: {n_verify} / {Rte.shape[0]}")
-    print(f"Float model test accuracy: {result['float_acc']:.3f}")
-    print(f"XyloSim test accuracy    : {xylo_acc:.3f}")
+    print(f"Float model accuracy     : {result['float_acc']:.3f}  "
+          f"(balanced: {result['float_bal_acc']:.3f})")
+    print(f"Float per-class recall   : {[f'{r:.3f}' for r in result['float_recalls']]}")
+    print(f"XyloSim accuracy         : {xylo_acc:.3f}  (balanced: {xylo_bal_acc:.3f})")
+    print(f"XyloSim per-class recall : {[f'{r:.3f}' for r in xylo_recalls]}")
     print(f"Float vs. XyloSim agree  : {agreement_rate:.3f}")
     print(f"Mean hidden spike rate   : {result['mean_hidden_rate']:.3f}")
     print("=" * 60)
 
-    result.update(xylo_acc=xylo_acc, agreement_rate=agreement_rate, n_verify=n_verify)
+    result.update(xylo_acc=xylo_acc, xylo_bal_acc=xylo_bal_acc,
+                   xylo_recalls=xylo_recalls, agreement_rate=agreement_rate,
+                   n_verify=n_verify)
     return result
 
 
@@ -261,8 +319,15 @@ def main():
                      help="cap on how many held-out windows to run through XyloSim")
     ap.add_argument("--no-combined", action="store_true",
                      help="skip the Part C one-chip co-residence check")
+    ap.add_argument("--window", type=int, default=None,
+                     help="override the synthetic generator's window length "
+                          "(timesteps fed to the Xylo net) — no effect on real "
+                          "data. For probing the window/timestep vs. XyloSim-"
+                          "agreement trade-off (see rockpool_models.py notes "
+                          "on bit-shift-decay drift over long windows).")
     args = ap.parse_args()
     real = args.real or args.require_real
+    loader_kwargs = {"window": args.window} if args.window is not None else {}
 
     modalities = ["ecg", "ppg"] if args.modality == "both" else [args.modality]
 
@@ -272,7 +337,7 @@ def main():
             modality, real=real, epochs=args.epochs, n_hidden=args.n_hidden,
             threshold=args.threshold, batch_size=128, lr=1e-2,
             spike_reg=args.spike_reg, seed=0, n_restarts=args.n_restarts,
-            require_real=args.require_real)
+            require_real=args.require_real, loader_kwargs=loader_kwargs)
         result = verify_modality(result, max_verify=args.max_verify)
         results.append(result)
 

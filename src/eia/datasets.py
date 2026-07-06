@@ -159,9 +159,13 @@ def load_ecg(prefer_real: bool = True, require_real: bool = False,
     if require_real and not prefer_real:
         raise ValueError("require_real=True has no effect with prefer_real=False "
                           "(nothing was asked to be real).")
+    # `window`, if given, applies to whichever loader actually runs — real or
+    # synthetic — so a caller probing the window/XyloSim-agreement trade-off
+    # (see rockpool_models.py) gets a like-for-like comparison either way.
+    window = synth_kwargs.pop("window", None)
     if prefer_real:
         try:
-            data = load_mitbih()
+            data = load_mitbih() if window is None else load_mitbih(window=window)
             data.requested_real = True
             return data
         except Exception as e:  # noqa: BLE001  — any failure -> synthetic (or raise)
@@ -171,6 +175,8 @@ def load_ecg(prefer_real: bool = True, require_real: bool = False,
                     "refusing to silently substitute synthetic ECG."
                 ) from e
             print(f"[warn] real MIT-BIH unavailable ({e}); falling back to synthetic ECG.")
+    if window is not None:
+        synth_kwargs["window"] = window
     data = make_synthetic_ecg(**synth_kwargs)
     data.requested_real = prefer_real
     return data
