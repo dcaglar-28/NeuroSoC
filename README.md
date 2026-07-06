@@ -76,21 +76,36 @@ accuracy/energy curve — how sparse you can go while keeping diagnostic accurac
 
 ## Verify on XyloSim (pre-hardware check)
 
-Before buying a Xylo HDK, confirm the PPG SNN survives being mapped, 8-bit
-quantized, and run on **XyloSim** — the bit-precise simulator whose traces
-match real silicon:
+Before buying a Xylo HDK, confirm each modality's SNN survives being mapped,
+8-bit quantized, and run on **XyloSim** — the bit-precise simulator whose
+traces match real silicon — and check how the modalities compose onto one
+chip:
 
 ```bash
-pip install "eia[xylo]"          # pulls in rockpool[xylo] (XyloSim, samna)
-python scripts/xylo_verify.py                # synthetic PPG, quick
-python scripts/xylo_verify.py --real         # real BIDMC PPG (needs wfdb + network)
+pip install "eia[xylo]"                     # pulls in rockpool[xylo] (XyloSim, samna)
+python scripts/xylo_verify.py               # ecg + ppg, synthetic, + one-chip co-residence check
+python scripts/xylo_verify.py --modality ppg           # just PPG
+python scripts/xylo_verify.py --modality ecg --real    # just ECG, real MIT-BIH (needs wfdb + network)
+python scripts/xylo_verify.py --real                   # both, real MIT-BIH + BIDMC
+python scripts/xylo_verify.py --no-combined            # skip the Part C one-chip check
 ```
 
-Prints float-model accuracy, XyloSim accuracy, and their agreement rate. See
-`docs/xylo_verification_task.md` for the full spec and known gotchas (this
-exact readout — 2 output neurons, spike-count logits — is prone to a
-dead-neuron collapse and a real quantization gap; the script's multi-restart
-training and `rockpool_models.build_xylo_snn`'s comments document both).
+For each modality: a data card, then float-model accuracy, XyloSim accuracy,
+and their agreement rate, then the mapped resource footprint (input/hidden/
+output neurons used vs. Xylo's limits). When both modalities run, also prints
+a **one-chip composition line** (`xylo_budget.fits_one_chip`) and a
+**co-residence check** — combines the two independently-trained nets onto one
+Xylo core (block-diagonal weights, single shared quantization) and confirms
+each modality's decisions still agree with its own standalone float model.
+
+See `docs/xylo_verification_task.md` and `docs/per_modality_xylo_verify_task.md`
+for the full specs and known gotchas — this exact readout (2 output neurons,
+spike-count logits) is prone to a dead-neuron collapse that only a positive
+initial bias fixes, the official tutorial's `PeriodicExponential` surrogate
+measurably regresses this net (kept on the evidence, not the tutorial's
+prior), and co-residence measurably costs some XyloSim fidelity vs. either
+modality's standalone number under a shared 8-bit weight budget. All
+documented in `rockpool_models.py` and `scripts/xylo_verify.py`.
 
 ## Run the tests
 

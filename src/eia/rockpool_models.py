@@ -104,6 +104,13 @@ def build_xylo_snn(n_hidden: int = 63, n_out: int = 2, dt: float = 1e-3):
     # Starting the bias positive gives every neuron some baseline firing at
     # init, which is what actually breaks the symmetry and lets training find
     # a discriminative solution; it stays trainable so it can still move.
+    # This still isn't bulletproof against class imbalance: on real MIT-BIH
+    # ECG (7.7% minority class), 5 restarts x 15 epochs all converged to the
+    # exact majority-baseline accuracy (0.923) — worse imbalance than the
+    # ~30-38% minority classes this net does learn on (synthetic ECG/PPG,
+    # BIDMC PPG). More restarts alone didn't fix it; a harder-imbalance-aware
+    # fix (class-weighted loss, oversampling) is the next thing to try if this
+    # modality needs a non-degenerate real-data number.
     #
     # LIFBitshiftTorch (not plain LIFTorch): Xylo doesn't have a continuous
     # exponential decay, it approximates it with a bit-shift ("dash"); this
@@ -113,6 +120,16 @@ def build_xylo_snn(n_hidden: int = 63, n_out: int = 2, dt: float = 1e-3):
     # float-vs-XyloSim agreement after quantization — the "quantization drop"
     # this module exists to prevent (train against the constraint, not more
     # epochs against the wrong one).
+    #
+    # NOT using spike_generation_fn=PeriodicExponential: the official Xylo
+    # training tutorial recommends it (it's tuned for its own audio task —
+    # many input channels, short windows), but on this net (2 in, 2 out, long
+    # single-biosignal windows) it measurably regressed both metrics we
+    # actually care about, A/B'd on synthetic PPG, 5 restarts x 40 epochs each,
+    # otherwise identical settings:
+    #   default (StepPWL)     : float acc 0.992, XyloSim agreement 0.877
+    #   PeriodicExponential   : float acc 0.772, XyloSim agreement 0.680
+    # Kept the default surrogate on the evidence, not the tutorial's prior.
     net = Sequential(
         LinearTorch((N_INPUT_CHANNELS, n_hidden), has_bias=False),
         LIFBitshiftTorch(n_hidden, tau_mem=Constant(0.02), tau_syn=Constant(0.02),
@@ -122,6 +139,70 @@ def build_xylo_snn(n_hidden: int = 63, n_out: int = 2, dt: float = 1e-3):
                           threshold=Constant(1.0), bias=0.5, dt=dt),
     )
     return net
+
+
+def build_combined_xylo_snn(nets: list, dt: float = 1e-3):
+    """Combine independently-trained per-modality nets onto one Xylo core.
+
+    Each `nets[i]` must be a `build_xylo_snn`-shaped Sequential (already
+    trained). Returns one bigger Sequential with block-diagonal input/output
+    weights — modality i's hidden units (and output neurons) only ever see
+    modality i's input channels and only ever drive modality i's outputs —
+    which is exactly how the mapper places independently-trained sub-nets in
+    Xylo's single shared `weights_rec`: per-neuron dynamics stay independent,
+    but the whole combined net gets ONE `global_quantize` scale (see
+    `map_and_quantize`), so this must be quantized as one unit, not per-block.
+    """
+    import torch
+    from rockpool.nn.modules import LIFBitshiftTorch, LinearTorch
+    from rockpool.nn.combinators import Sequential
+    from rockpool.parameters import Constant
+
+    n_ins = [net[0].shape[0] for net in nets]
+    n_hiddens = [net[0].shape[1] for net in nets]
+    n_outs = [net[2].shape[1] for net in nets]
+    total_in, total_hidden, total_out = sum(n_ins), sum(n_hiddens), sum(n_outs)
+
+    if total_in > XYLO_MAX_INPUT_CHANNELS:
+        raise ValueError(
+            f"combined input channels={total_in} exceeds Xylo budget "
+            f"({XYLO_MAX_INPUT_CHANNELS})")
+    if total_hidden > XYLO_MAX_HIDDEN_NEURONS:
+        raise ValueError(
+            f"combined hidden neurons={total_hidden} exceeds Xylo budget "
+            f"({XYLO_MAX_HIDDEN_NEURONS})")
+    if total_out > XYLO_MAX_OUTPUT_CHANNELS:
+        raise ValueError(
+            f"combined output neurons={total_out} exceeds Xylo budget "
+            f"({XYLO_MAX_OUTPUT_CHANNELS})")
+
+    w_in = torch.zeros(total_in, total_hidden)
+    w_out = torch.zeros(total_hidden, total_out)
+    hidden_bias = torch.zeros(total_hidden)
+    output_bias = torch.zeros(total_out)
+
+    in_off = hid_off = out_off = 0
+    for net, n_in, n_hid, n_out in zip(nets, n_ins, n_hiddens, n_outs):
+        w_in[in_off:in_off + n_in, hid_off:hid_off + n_hid] = net[0].weight.detach()
+        w_out[hid_off:hid_off + n_hid, out_off:out_off + n_out] = net[2].weight.detach()
+        # LIFBitshiftTorch's bias here is a single scalar shared across the
+        # whole layer (see build_xylo_snn); broadcast it across this
+        # sub-net's block of the combined per-neuron bias vector.
+        hidden_bias[hid_off:hid_off + n_hid] = net[1].bias.detach()
+        output_bias[out_off:out_off + n_out] = net[3].bias.detach()
+        in_off += n_in
+        hid_off += n_hid
+        out_off += n_out
+
+    combined = Sequential(
+        LinearTorch((total_in, total_hidden), has_bias=False, weight=w_in),
+        LIFBitshiftTorch(total_hidden, tau_mem=Constant(0.02), tau_syn=Constant(0.02),
+                          threshold=Constant(1.0), bias=hidden_bias, dt=dt),
+        LinearTorch((total_hidden, total_out), has_bias=False, weight=w_out),
+        LIFBitshiftTorch(total_out, tau_mem=Constant(0.02), tau_syn=Constant(0.02),
+                          threshold=Constant(1.0), bias=output_bias, dt=dt),
+    )
+    return combined, n_ins, n_hiddens, n_outs
 
 
 def to_input_raster(spikes_2ch):
@@ -137,21 +218,38 @@ def to_input_raster(spikes_2ch):
     return arr.astype("float32")
 
 
-def map_and_quantize(net):
+def map_and_quantize(net, method: str = "global"):
     """Map a trained Rockpool net to a Xylo spec and quantize to integer logic.
 
     Returns the quantized `spec` dict consumed by `config_from_specification`.
-    Uses `global_quantize` (shared representation) as in the deploy guide.
-    (`channel_quantize`, per-target-neuron scaling, was also tried on the PPG
-    task and made no measurable difference to float-vs-XyloSim agreement —
-    the residual gap is from the bit-shift-quantized decay dynamics over a
-    long window, not the weight quantization method.)
+
+    Args:
+        method: "global" (default, one shared scale for the whole network, as
+            in the deploy guide) or "channel" (per-target-neuron scaling).
+            For a single small net the two made no measurable difference
+            (tried on the PPG task). For a *combined* multi-modality net
+            (`build_combined_xylo_snn`), where two independently-trained
+            sub-nets' weight magnitudes can differ, "global" wastes range on
+            whichever sub-net is smaller — this is the exact failure mode
+            `docs/per_modality_xylo_verify_task.md` Part C warns about, and
+            "channel" is the documented fix.
     """
     from rockpool.transform import quantize_methods as q
 
     x = _xylo_support()
     spec = x.mapper(net.as_graph(), weight_dtype="float")
-    spec.update(q.global_quantize(**spec))
+    quantize_fn = q.channel_quantize if method == "channel" else q.global_quantize
+    try:
+        quantized = quantize_fn(**spec)
+    except TypeError:
+        # Some Rockpool versions' global_quantize doesn't accept every key the
+        # mapper puts in `spec` (e.g. `mapped_graph`, `dt`) — the official
+        # Xylo training tutorial strips those two before quantizing. Our
+        # installed version's global_quantize has a **kwargs catch-all so this
+        # never actually triggers, but keep the fallback for older/newer ones.
+        stripped = {k: v for k, v in spec.items() if k not in ("mapped_graph", "dt")}
+        quantized = quantize_fn(**stripped)
+    spec.update(quantized)
     return spec
 
 
