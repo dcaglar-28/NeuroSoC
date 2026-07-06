@@ -1,0 +1,153 @@
+"""Per-dataset data cards + red-flag warnings.
+
+Design principle: each dataset is its own experiment. `data_card()` prints a
+short, structured summary of exactly what is being trained on — source, label
+definition, class balance, and known limitations — and raises explicit warnings
+for the traps that are easy to miss (class imbalance, tiny N, a model that only
+matches the majority-class base rate, NaNs). It never pools or compares across
+datasets; call it once per dataset.
+
+Pure NumPy — imports and runs without torch.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import numpy as np
+
+# Per-(modality, source) label definition + known limitations. Keep honest:
+# say plainly when a label is a proxy.
+_CARDS = {
+    ("ecg", "synthetic"): (
+        "0 = normal PQRST complex, 1 = PVC-like beat (wide QRS, no P, discordant T).",
+        "Separable by construction — expect ~1.0 accuracy. Proves the pipeline, "
+        "NOT a real-accuracy claim.",
+    ),
+    ("ecg", "mitbih"): (
+        "0 = normal AAMI beat (N/L/R/e/j), 1 = abnormal (V/A/F/!/E).",
+        "Real clinical ECG (MIT-BIH). Single-lead, subset of records.",
+    ),
+    ("ppg", "synthetic"): (
+        "0 = normovolemic pulse, 1 = hypovolemic (reduced amplitude, blunted "
+        "dicrotic notch) — a Compensatory-Reserve-style waveform change.",
+        "Synthetic. Closest generator to the real hemorrhage target, but not "
+        "real physiology.",
+    ),
+    ("ppg", "bidmc"): (
+        "0 = SpO2 >= 95%, 1 = SpO2 < 95% over the window.",
+        "SpO2-desaturation PROXY for physiological compromise — NOT a hemorrhage "
+        "label. High sim-agreement here can mean 'not learning', not 'good'.",
+    ),
+    ("ppg", "lbnp"): (
+        "Binary compromise from lower-body-negative-pressure stage / blood-volume "
+        "decrement (see loader for exact threshold).",
+        "Real induced central hypovolemia — the intended hemorrhage signal. "
+        "Usually few subjects: split by subject, watch N.",
+    ),
+}
+
+
+@dataclass
+class DataCard:
+    modality: str
+    source: str
+    n_samples: int
+    window: int
+    fs: float
+    duration_s: float
+    class_counts: dict
+    class_fracs: dict
+    majority_base_rate: float
+    label_definition: str
+    limitations: str
+    warnings: list = field(default_factory=list)
+
+    def __str__(self) -> str:
+        lines = [
+            "=" * 66,
+            f" DATA CARD — {self.modality.upper()} / {self.source}",
+            "=" * 66,
+            f" samples        : {self.n_samples}",
+            f" window         : {self.window} samples  (~{self.duration_s:.2f}s @ {self.fs:g} Hz)",
+            f" class balance  : {self.class_fracs}  (counts {self.class_counts})",
+            f" majority base  : {self.majority_base_rate:.3f}  "
+            f"(a model at this accuracy has learned nothing)",
+            f" label          : {self.label_definition}",
+            f" limitations    : {self.limitations}",
+        ]
+        if self.warnings:
+            lines.append(" " + "-" * 64)
+            for w in self.warnings:
+                lines.append(f" [warn] {self.source}: {w}")
+        lines.append("=" * 66)
+        return "\n".join(lines)
+
+
+def _modality_of(data) -> str:
+    name = type(data).__name__.lower()
+    if name.startswith("ecg"):
+        return "ecg"
+    if name.startswith("ppg"):
+        return "ppg"
+    return getattr(data, "modality", "unknown")
+
+
+def data_card(data, model_acc: float | None = None, verbose: bool = True,
+              imbalance_frac: float = 0.15, small_n: int = 200,
+              base_rate_hi: float = 0.65, not_learning_margin: float = 0.03) -> DataCard:
+    """Build (and optionally print) a data card for one dataset.
+
+    Args:
+        data: an EcgData / PpgData (has .X, .y, .fs, .source).
+        model_acc: optional test accuracy of a trained model on this dataset;
+            if within `not_learning_margin` of the base rate, raises a warning.
+        verbose: print the card.
+    """
+    X = np.asarray(data.X)
+    y = np.asarray(data.y).astype(int)
+    modality = _modality_of(data)
+    source = getattr(data, "source", "unknown")
+    n = int(y.size)
+    window = int(X.shape[1]) if X.ndim >= 2 else 0
+    fs = float(getattr(data, "fs", 0.0) or 0.0)
+    duration_s = (window / fs) if fs else 0.0
+
+    classes, counts = np.unique(y, return_counts=True)
+    class_counts = {int(c): int(k) for c, k in zip(classes, counts)}
+    class_fracs = {int(c): round(float(k) / n, 3) for c, k in zip(classes, counts)} if n else {}
+    base_rate = float(counts.max() / n) if n else 0.0
+
+    label_def, limitations = _CARDS.get(
+        (modality, source), ("(undocumented label)", "(no limitations recorded)"))
+
+    warnings = []
+    if n and len(classes) > 1:
+        minority = counts.min() / n
+        if minority < imbalance_frac:
+            warnings.append(
+                f"class imbalance — minority class is {minority:.1%} of samples.")
+    if len(classes) < 2:
+        warnings.append("only one class present — classification is degenerate.")
+    if n < small_n:
+        warnings.append(f"small dataset (N={n} < {small_n}); results are noisy.")
+    if base_rate > base_rate_hi:
+        warnings.append(
+            f"high majority base rate ({base_rate:.1%}); treat near-base-rate "
+            f"accuracy as 'not learning', not success.")
+    if model_acc is not None and (model_acc - base_rate) < not_learning_margin:
+        warnings.append(
+            f"model accuracy {model_acc:.3f} is within {not_learning_margin:.0%} "
+            f"of base rate {base_rate:.3f} — model is NOT learning the signal.")
+    if X.size and not np.isfinite(X).all():
+        warnings.append("non-finite values present in X (NaN/inf).")
+
+    card = DataCard(
+        modality=modality, source=source, n_samples=n, window=window, fs=fs,
+        duration_s=duration_s, class_counts=class_counts, class_fracs=class_fracs,
+        majority_base_rate=base_rate, label_definition=label_def,
+        limitations=limitations, warnings=warnings,
+    )
+    if verbose:
+        print(card)
+    return card
