@@ -61,6 +61,7 @@ class DataCard:
     majority_base_rate: float
     label_definition: str
     limitations: str
+    provenance: str = "unknown"  # "REAL", "SYNTHETIC", or "SYNTHETIC (FALLBACK)"
     warnings: list = field(default_factory=list)
 
     def __str__(self) -> str:
@@ -68,6 +69,7 @@ class DataCard:
             "=" * 66,
             f" DATA CARD — {self.modality.upper()} / {self.source}",
             "=" * 66,
+            f" provenance     : {self.provenance}",
             f" samples        : {self.n_samples}",
             f" window         : {self.window} samples  (~{self.duration_s:.2f}s @ {self.fs:g} Hz)",
             f" class balance  : {self.class_fracs}  (counts {self.class_counts})",
@@ -121,6 +123,13 @@ def data_card(data, model_acc: float | None = None, verbose: bool = True,
     label_def, limitations = _CARDS.get(
         (modality, source), ("(undocumented label)", "(no limitations recorded)"))
 
+    requested_real = bool(getattr(data, "requested_real", False))
+    if source == "synthetic":
+        provenance = "SYNTHETIC (FALLBACK — real data request failed)" if requested_real \
+            else "SYNTHETIC (requested)"
+    else:
+        provenance = f"REAL ({source})"
+
     warnings = []
     if n and len(classes) > 1:
         minority = counts.min() / n
@@ -146,8 +155,32 @@ def data_card(data, model_acc: float | None = None, verbose: bool = True,
         modality=modality, source=source, n_samples=n, window=window, fs=fs,
         duration_s=duration_s, class_counts=class_counts, class_fracs=class_fracs,
         majority_base_rate=base_rate, label_definition=label_def,
-        limitations=limitations, warnings=warnings,
+        limitations=limitations, provenance=provenance, warnings=warnings,
     )
     if verbose:
         print(card)
     return card
+
+
+def assert_provenance(card: DataCard, data, expected_modality: str) -> None:
+    """Guard against training/verifying on different data than the card
+    describes — the exact bug class this repo hit once already: a notebook
+    cell requested PPG (data card + plots all showed PPG) but the training
+    call silently defaulted to ECG because `modality=` wasn't threaded
+    through. Call this right after `data_card(data)`, before any training.
+
+    Raises ValueError (not a bare `assert`, which `-O` can strip) if the
+    card's modality doesn't match what the caller is about to train/verify
+    on, or if the card's source doesn't match the actual data object's.
+    """
+    data_source = getattr(data, "source", None)
+    if card.modality != expected_modality:
+        raise ValueError(
+            f"provenance mismatch: about to train/verify modality="
+            f"{expected_modality!r} but the data card reports modality="
+            f"{card.modality!r} — wrong data object for this run.")
+    if card.source != data_source:
+        raise ValueError(
+            f"provenance mismatch: data card source={card.source!r} but the "
+            f"data object's source={data_source!r} — card was built from a "
+            f"different (or since-mutated) data object.")

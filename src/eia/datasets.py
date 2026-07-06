@@ -23,6 +23,12 @@ class EcgData:
     y: np.ndarray  # (n_samples,) int64  — 0 = normal, 1 = abnormal
     fs: float      # sampling rate (Hz)
     source: str    # "mitbih" or "synthetic"
+    # True iff the caller asked for real data (prefer_real=True), regardless
+    # of whether it actually got real data. Combined with `source`, this is
+    # what distinguishes "synthetic because that's what was asked for" from
+    # "synthetic because the real load silently failed" — see
+    # `report.data_card`'s provenance line and `load_ecg`'s [warn] print.
+    requested_real: bool = False
 
 
 @dataclass
@@ -31,6 +37,7 @@ class PpgData:
     y: np.ndarray  # (n_samples,) int64  — 0 = normal, 1 = abnormal
     fs: float      # sampling rate (Hz)
     source: str    # "bidmc" or "synthetic"
+    requested_real: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -137,14 +144,36 @@ def load_mitbih(
                    fs=fs, source="mitbih")
 
 
-def load_ecg(prefer_real: bool = True, **synth_kwargs) -> EcgData:
-    """Load ECG data, preferring real MIT-BIH but falling back to synthetic."""
+def load_ecg(prefer_real: bool = True, require_real: bool = False,
+             **synth_kwargs) -> EcgData:
+    """Load ECG data, preferring real MIT-BIH but falling back to synthetic.
+
+    Args:
+        prefer_real: try `load_mitbih()` first.
+        require_real: if real data was requested (`prefer_real=True`) and
+            fails to load, raise instead of silently falling back to
+            synthetic. Every fallback that IS allowed still prints a `[warn]`
+            line naming the reason, so provenance is never silent even when
+            this is left False.
+    """
+    if require_real and not prefer_real:
+        raise ValueError("require_real=True has no effect with prefer_real=False "
+                          "(nothing was asked to be real).")
     if prefer_real:
         try:
-            return load_mitbih()
-        except Exception as e:  # noqa: BLE001  — any failure -> synthetic
-            print(f"[datasets] real MIT-BIH unavailable ({e}); using synthetic.")
-    return make_synthetic_ecg(**synth_kwargs)
+            data = load_mitbih()
+            data.requested_real = True
+            return data
+        except Exception as e:  # noqa: BLE001  — any failure -> synthetic (or raise)
+            if require_real:
+                raise RuntimeError(
+                    f"--require-real: real MIT-BIH failed to load ({e}); "
+                    "refusing to silently substitute synthetic ECG."
+                ) from e
+            print(f"[warn] real MIT-BIH unavailable ({e}); falling back to synthetic ECG.")
+    data = make_synthetic_ecg(**synth_kwargs)
+    data.requested_real = prefer_real
+    return data
 
 
 # --------------------------------------------------------------------------- #
@@ -264,11 +293,33 @@ def load_bidmc_ppg(
                     fs=fs, source="bidmc")
 
 
-def load_ppg(prefer_real: bool = True, **synth_kwargs) -> PpgData:
-    """Load PPG data, preferring real BIDMC but falling back to synthetic."""
+def load_ppg(prefer_real: bool = True, require_real: bool = False,
+             **synth_kwargs) -> PpgData:
+    """Load PPG data, preferring real BIDMC but falling back to synthetic.
+
+    Args:
+        prefer_real: try `load_bidmc_ppg()` first.
+        require_real: if real data was requested (`prefer_real=True`) and
+            fails to load, raise instead of silently falling back to
+            synthetic. Every fallback that IS allowed still prints a `[warn]`
+            line naming the reason, so provenance is never silent even when
+            this is left False.
+    """
+    if require_real and not prefer_real:
+        raise ValueError("require_real=True has no effect with prefer_real=False "
+                          "(nothing was asked to be real).")
     if prefer_real:
         try:
-            return load_bidmc_ppg()
-        except Exception as e:  # noqa: BLE001  — any failure -> synthetic
-            print(f"[datasets] real BIDMC PPG unavailable ({e}); using synthetic.")
-    return make_synthetic_ppg(**synth_kwargs)
+            data = load_bidmc_ppg()
+            data.requested_real = True
+            return data
+        except Exception as e:  # noqa: BLE001  — any failure -> synthetic (or raise)
+            if require_real:
+                raise RuntimeError(
+                    f"--require-real: real BIDMC PPG failed to load ({e}); "
+                    "refusing to silently substitute synthetic PPG."
+                ) from e
+            print(f"[warn] real BIDMC PPG unavailable ({e}); falling back to synthetic PPG.")
+    data = make_synthetic_ppg(**synth_kwargs)
+    data.requested_real = prefer_real
+    return data

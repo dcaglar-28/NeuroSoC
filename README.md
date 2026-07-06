@@ -54,7 +54,16 @@ python -m eia.train --real                     # real MIT-BIH (needs: pip instal
 python -m eia.train --modality ppg --real      # real BIDMC PPG & Respiration dataset
 python -m eia.train --sweep                    # trace the accuracy vs. energy trade-off
 python -m eia.train --modality ppg --sweep --real
+python -m eia.train --real --require-real      # fail loudly instead of silently using synthetic
+                                                # if the real dataset can't be loaded
 ```
+
+Every run prints a `[data] ... provenance=...` line (or, in `xylo_verify.py`, a
+full data card) so you can always see from the output alone whether a run
+actually used real data, synthetic by request, or synthetic as a fallback.
+`--real` alone still falls back to synthetic if the real dataset can't load —
+but that fallback always prints a `[warn]` line naming why, never silently.
+Add `--require-real` to turn that fallback into a hard error instead.
 
 Expected output: baseline vs. SNN accuracy, the SNN's mean spike rate, and an
 energy report (dense MACs vs. spiking SOPs, and the ratio).
@@ -87,6 +96,7 @@ python scripts/xylo_verify.py               # ecg + ppg, synthetic, + one-chip c
 python scripts/xylo_verify.py --modality ppg           # just PPG
 python scripts/xylo_verify.py --modality ecg --real    # just ECG, real MIT-BIH (needs wfdb + network)
 python scripts/xylo_verify.py --real                   # both, real MIT-BIH + BIDMC
+python scripts/xylo_verify.py --real --require-real    # fail loudly, don't fall back, if real data can't load
 python scripts/xylo_verify.py --no-combined            # skip the Part C one-chip check
 ```
 

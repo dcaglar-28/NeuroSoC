@@ -60,14 +60,19 @@ def _eval(net, R, y_t):
 
 def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
                     threshold: float, batch_size: int, lr: float,
-                    spike_reg: float, seed: int, n_restarts: int):
+                    spike_reg: float, seed: int, n_restarts: int,
+                    require_real: bool = False):
     """Part A (train half): data card + multi-restart training with
     val-accuracy checkpoint selection (see build_xylo_snn for why this net
     needs restarts). Returns the trained net plus held-out tensors, reused
     both for this modality's own XyloSim check and Part C's combined check.
     """
-    data = _LOADERS[modality](prefer_real=real)
-    report.data_card(data)
+    data = _LOADERS[modality](prefer_real=real, require_real=require_real)
+    card = report.data_card(data)
+    # Guards the exact bug this repo hit once already: a data object loaded
+    # for one modality silently fed to training/reporting for another (see
+    # notebooks/01_ecg_snn.ipynb history). Cheap and always-on.
+    report.assert_provenance(card, data, modality)
     n_classes = int(np.asarray(data.y).max()) + 1
 
     # Held out for final reporting — never used for model selection below.
@@ -126,6 +131,8 @@ def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
     return {
         "modality": modality, "source": data.source, "net": net, "spec": spec,
         "n_hidden": n_hidden, "n_out": n_classes,
+        "n_samples": int(data.X.shape[0]), "provenance": card.provenance,
+        "requested_real": bool(data.requested_real),
         "Rte": Rte, "yte_t": yte_t, "float_preds": float_preds,
         "float_acc": float_acc, "mean_hidden_rate": mean_hidden_rate,
         "is_valid": is_valid,
@@ -133,7 +140,14 @@ def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
 
 
 def verify_modality(result: dict, max_verify: int) -> dict:
-    """Part A (verify half): run XyloSim over held-out windows, print report."""
+    """Part A (verify half): run XyloSim over held-out windows, print report.
+
+    Operates purely on the `result` dict `train_modality` produced — the
+    trained `net`, its `spec`, and the held-out `Rte`/`yte_t` all came from
+    the one `data` object `train_modality` loaded and already checked with
+    `report.assert_provenance`, so there is no second load here that could
+    diverge from it. This function only reports; it doesn't re-fetch data.
+    """
     net, spec, Rte, yte_t = result["net"], result["spec"], result["Rte"], result["yte_t"]
     n_verify = min(max_verify, Rte.shape[0])
     matches, xylo_correct = 0, 0
@@ -147,6 +161,9 @@ def verify_modality(result: dict, max_verify: int) -> dict:
     modality, source = result["modality"], result["source"]
     header = f" XYLO VERIFICATION -- {modality.upper()} ({source}) "
     print(f"\n{header:=^60}")
+    print(f"Modality / source        : {modality} / {source}")
+    print(f"Provenance               : {result['provenance']}")
+    print(f"Total samples (dataset)  : {result['n_samples']}")
     print(f"Held-out windows verified: {n_verify} / {Rte.shape[0]}")
     print(f"Float model test accuracy: {result['float_acc']:.3f}")
     print(f"XyloSim test accuracy    : {xylo_acc:.3f}")
@@ -232,6 +249,9 @@ def main():
     ap.add_argument("--modality", choices=["ecg", "ppg", "both"], default="both")
     ap.add_argument("--real", action="store_true",
                      help="use real data (MIT-BIH for ecg, BIDMC for ppg)")
+    ap.add_argument("--require-real", action="store_true",
+                     help="raise instead of silently falling back to synthetic "
+                          "if real data fails to load (implies --real)")
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--n-hidden", type=int, default=63)
     ap.add_argument("--threshold", type=float, default=0.25)
@@ -242,15 +262,17 @@ def main():
     ap.add_argument("--no-combined", action="store_true",
                      help="skip the Part C one-chip co-residence check")
     args = ap.parse_args()
+    real = args.real or args.require_real
 
     modalities = ["ecg", "ppg"] if args.modality == "both" else [args.modality]
 
     results = []
     for modality in modalities:
         result = train_modality(
-            modality, real=args.real, epochs=args.epochs, n_hidden=args.n_hidden,
+            modality, real=real, epochs=args.epochs, n_hidden=args.n_hidden,
             threshold=args.threshold, batch_size=128, lr=1e-2,
-            spike_reg=args.spike_reg, seed=0, n_restarts=args.n_restarts)
+            spike_reg=args.spike_reg, seed=0, n_restarts=args.n_restarts,
+            require_real=args.require_real)
         result = verify_modality(result, max_verify=args.max_verify)
         results.append(result)
 

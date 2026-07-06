@@ -18,7 +18,7 @@ import time
 
 import numpy as np
 
-from . import encoding, energy
+from . import encoding, energy, report
 from .datasets import load_ecg, load_ppg
 from .device import get_device
 from .models import build_baseline, build_snn
@@ -37,7 +37,8 @@ def _encode_batch(X: np.ndarray, threshold: float) -> np.ndarray:
 def run(real: bool = False, epochs: int = 10, hidden: int = 128,
         timesteps: int = 20, threshold: float = 0.25, batch_size: int = 128,
         lr: float = 1e-3, spike_reg: float = 5e-2, device_pref: str = "auto",
-        seed: int = 0, verbose: bool = True, modality: str = "ecg"):
+        seed: int = 0, verbose: bool = True, modality: str = "ecg",
+        require_real: bool = False):
     import torch
     import torch.nn as nn
     from sklearn.model_selection import train_test_split
@@ -47,8 +48,15 @@ def run(real: bool = False, epochs: int = 10, hidden: int = 128,
     device = get_device(device_pref)
     print(f"[device] {device}")
 
-    data = _LOADERS[modality](prefer_real=real)
-    print(f"[data] modality={modality}  source={data.source}  X={data.X.shape}  "
+    data = _LOADERS[modality](prefer_real=real, require_real=require_real)
+    card = report.data_card(data, verbose=False)
+    # Guards the exact bug this repo hit once already: a data object loaded
+    # for one modality silently fed to training/reporting for another (see
+    # notebooks/01_ecg_snn.ipynb history). Cheap and always-on, not just in
+    # debug builds — this is a correctness invariant, not a bare `assert`.
+    report.assert_provenance(card, data, modality)
+    print(f"[data] modality={modality}  source={data.source}  "
+          f"provenance={card.provenance}  X={data.X.shape}  "
           f"pos_frac={data.y.mean():.2f}  fs={data.fs}Hz")
 
     Xtr, Xte, ytr, yte = train_test_split(
@@ -118,7 +126,7 @@ def run(real: bool = False, epochs: int = 10, hidden: int = 128,
     # ------------------------------------------------------------------ #
     # Energy comparison (per single inference)
     # ------------------------------------------------------------------ #
-    report = energy.compare(net.layer_sizes, timesteps, avg_spike_rate=mean_rate)
+    energy_report = energy.compare(net.layer_sizes, timesteps, avg_spike_rate=mean_rate)
 
     if verbose:
         print("\n===== RESULTS =====")
@@ -127,18 +135,19 @@ def run(real: bool = False, epochs: int = 10, hidden: int = 128,
         print(f"SNN mean hidden spike rate : {mean_rate:.3f}")
         print(f"SNN train time             : {train_time:.1f}s ({epochs} epochs)")
         print("-------------------")
-        print(report)
+        print(energy_report)
         print("===================")
     return {
         "baseline_acc": base_acc, "snn_acc": snn_acc, "mean_rate": mean_rate,
-        "energy_ratio": report.energy_ratio, "source": data.source,
+        "energy_ratio": energy_report.energy_ratio, "source": data.source,
         "timesteps": timesteps, "threshold": threshold, "modality": modality,
     }
 
 
 def sweep(real: bool = False, epochs: int = 10, device_pref: str = "auto",
           timesteps_grid=(10, 20, 40), threshold_grid=(0.15, 0.25, 0.4),
-          spike_reg: float = 5e-2, modality: str = "ecg"):
+          spike_reg: float = 5e-2, modality: str = "ecg",
+          require_real: bool = False):
     """Trace the accuracy vs. energy trade-off across encoder/timestep settings.
 
     This is the core Phase-0 deliverable: show how sparse and how few timesteps
@@ -153,7 +162,7 @@ def sweep(real: bool = False, epochs: int = 10, device_pref: str = "auto",
         for th in threshold_grid:
             r = run(real=real, epochs=epochs, timesteps=T, threshold=th,
                     spike_reg=spike_reg, device_pref=device_pref, verbose=False,
-                    modality=modality)
+                    modality=modality, require_real=require_real)
             rows.append(r)
             marker = "  <- SNN cheaper" if r["energy_ratio"] > 1 else ""
             print(f"{T:>9} {th:>9.2f} {r['snn_acc']:>8.3f} {r['baseline_acc']:>8.3f} "
@@ -167,6 +176,9 @@ def main():
                     help="which physiological signal to classify")
     ap.add_argument("--real", action="store_true",
                     help="try real data (MIT-BIH for ecg, BIDMC for ppg)")
+    ap.add_argument("--require-real", action="store_true",
+                    help="raise instead of silently falling back to synthetic "
+                         "if real data fails to load (implies --real)")
     ap.add_argument("--sweep", action="store_true",
                     help="trace the accuracy/energy trade-off across settings")
     ap.add_argument("--epochs", type=int, default=10)
@@ -177,14 +189,16 @@ def main():
                     help="sparsity penalty weight (higher = fewer spikes)")
     ap.add_argument("--device", default="auto", choices=["auto", "mps", "cuda", "cpu"])
     args = ap.parse_args()
+    real = args.real or args.require_real
     if args.sweep:
-        sweep(real=args.real, epochs=args.epochs, device_pref=args.device,
-              spike_reg=args.spike_reg, modality=args.modality)
+        sweep(real=real, epochs=args.epochs, device_pref=args.device,
+              spike_reg=args.spike_reg, modality=args.modality,
+              require_real=args.require_real)
     else:
-        run(real=args.real, epochs=args.epochs, hidden=args.hidden,
+        run(real=real, epochs=args.epochs, hidden=args.hidden,
             timesteps=args.timesteps, threshold=args.threshold,
             spike_reg=args.spike_reg, device_pref=args.device,
-            modality=args.modality)
+            modality=args.modality, require_real=args.require_real)
 
 
 if __name__ == "__main__":
