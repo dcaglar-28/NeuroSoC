@@ -34,9 +34,8 @@ import copy
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.model_selection import GroupShuffleSplit, train_test_split
 
-from eia import encoding, report, rockpool_models as rm, xylo_budget as xb
+from eia import case_level, encoding, report, rockpool_models as rm, xylo_budget as xb
 from eia.datasets import load_ecg, load_ppg, load_ppg_vitaldb
 
 _LOADERS = {"ecg": load_ecg, "ppg": load_ppg}
@@ -105,42 +104,6 @@ def _margin_loss(vmem_mean: torch.Tensor, y: torch.Tensor, lossfn: nn.Module) ->
     return lossfn(vmem_mean, y)
 
 
-def _split_data(data, seed: int):
-    """Case/subject-grouped split when `data.groups` is set (VitalDB: many
-    highly-correlated windows per surgical case sharing one label — must not
-    straddle train/val/test), plain stratified split otherwise. Prints the
-    per-split case counts (and raises on any overlap) so grouping is visible
-    in the log, not just silently trusted to the splitter."""
-    groups = getattr(data, "groups", None)
-    if groups is None:
-        Xfit, Xte, yfit, yte = train_test_split(
-            data.X, data.y, test_size=0.25, random_state=seed, stratify=data.y)
-        Xtr, Xval, ytr, yval = train_test_split(
-            Xfit, yfit, test_size=0.2, random_state=seed, stratify=yfit)
-        return Xtr, Xval, Xte, ytr, yval, yte
-
-    gss1 = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=seed)
-    fit_idx, te_idx = next(gss1.split(data.X, data.y, groups=groups))
-    Xfit, Xte = data.X[fit_idx], data.X[te_idx]
-    yfit, yte = data.y[fit_idx], data.y[te_idx]
-    groups_fit = groups[fit_idx]
-
-    gss2 = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=seed)
-    tr_idx, val_idx = next(gss2.split(Xfit, yfit, groups=groups_fit))
-    Xtr, Xval = Xfit[tr_idx], Xfit[val_idx]
-    ytr, yval = yfit[tr_idx], yfit[val_idx]
-
-    tr_cases, val_cases = set(groups_fit[tr_idx].tolist()), set(groups_fit[val_idx].tolist())
-    te_cases = set(groups[te_idx].tolist())
-    overlap = (tr_cases & val_cases) | (tr_cases & te_cases) | (val_cases & te_cases)
-    print(f"[split] case-grouped: {len(tr_cases)} train / {len(val_cases)} val "
-          f"/ {len(te_cases)} test cases"
-          + (f"  [warn] OVERLAP: {overlap}" if overlap else "  (no case overlap)"))
-    if overlap:
-        raise RuntimeError(f"case-level leakage across splits: {overlap}")
-    return Xtr, Xval, Xte, ytr, yval, yte
-
-
 def _eval(net, R, y_t, n_classes: int):
     net.reset_state()
     with torch.no_grad():
@@ -197,8 +160,9 @@ def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
 
     # Held out for final reporting — never used for model selection below.
     # Case-grouped when `data.groups` is set (VitalDB), plain-stratified
-    # otherwise — see `_split_data`.
-    Xtr, Xval, Xte, ytr, yval, yte = _split_data(data, seed)
+    # otherwise — see `eia.case_level.split_data`.
+    Xtr, Xval, Xte, ytr, yval, yte, _groups_tr, _groups_val, _groups_te = \
+        case_level.split_data(data, seed)
 
     Rtr = torch.tensor(_encode_batch(Xtr, threshold))
     Rval = torch.tensor(_encode_batch(Xval, threshold))

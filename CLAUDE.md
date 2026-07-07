@@ -283,6 +283,20 @@ Current state:
   a real step up in *label realism* over BIDMC's SpO2 proxy; it is not (yet)
   a step up in *per-window learnability* — case-level pooling or a graded EBL
   target are the follow-ups if this is revisited, not attempted here.
+- **Case-level rescue attempted (see docs/vitaldb_case_level_task.md /
+  docs/vitaldb_case_level_results.md): ALSO ~chance.** `intraop_ebl` is a
+  whole-case label, so the statistically honest use of it is one prediction
+  per case (`scripts/vitaldb_case_level.py`: train the same per-window SNN
+  unchanged, mean-pool its per-window output probabilities into one
+  host-side score per case — the Xylo core still only classifies individual
+  windows). 300 cases, 5 seeds: case-level balanced accuracy 0.516 +/- 0.019
+  — tight and flat at chance, not just noisy. AUROC (0.589 +/- 0.062) is
+  marginally above 0.5 but doesn't survive contact with an actual 0.5
+  decision threshold. **Conclusion: VitalDB's intraoperative,
+  anesthesia-confounded PPG does not carry a usable blood-loss signal at
+  either the per-window or the per-case granularity. Settled; do not keep
+  tuning VitalDB.** The honest path to a flagship hemorrhage signal is the
+  gated LBNP dataset or the synthetic time-resolved generator.
 
 Key finding: the SNN energy advantage is **not automatic** — it requires low
 spike rate + few timesteps (ops scale with `spike_rate x timesteps`). Training
