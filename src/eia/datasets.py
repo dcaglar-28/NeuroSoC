@@ -106,12 +106,29 @@ def make_synthetic_ecg(
 def load_mitbih(
     records=("100", "101", "103", "105", "111", "118", "200", "201", "210", "214"),
     window: int = 187,
+    resample_to: int | None = None,
 ) -> EcgData:
     """Stream a subset of MIT-BIH Arrhythmia beats from PhysioNet.
 
     Normal (N) vs. non-normal AAMI classes -> binary label. Requires `wfdb` and
     network access. Raises ImportError/RuntimeError if unavailable; callers that
     want a guaranteed result should use `load_ecg()` instead.
+
+    Args:
+        window: native samples extracted per beat, at MIT-BIH's native 360 Hz
+            (i.e. a *physiological capture duration*, not a Xylo timestep
+            budget — see `resample_to`).
+        resample_to: if given, FFT-resample each extracted beat from `window`
+            native samples down (or up) to this many samples, and rescale
+            `fs` to match. This decouples "how much signal do we capture"
+            from "how many timesteps the Xylo net spends processing it" —
+            the fix for the bug documented in
+            `docs/ecg_quant_diagnosis.md`/`rockpool_models.build_xylo_snn`:
+            naively setting `window=90` on real data captured only 90/360 =
+            250ms, not the 90/125 = 720ms the same number meant for the
+            synthetic generator. Capture the physiological duration you want
+            via `window` (at native fs), then use `resample_to` to pick the
+            Xylo timestep count independently.
     """
     try:
         import wfdb
@@ -139,6 +156,10 @@ def load_mitbih(
     if not X_list:
         raise RuntimeError("No beats extracted from MIT-BIH.")
     X = np.stack(X_list)
+    if resample_to is not None and resample_to != window:
+        from scipy.signal import resample as _fft_resample
+        X = _fft_resample(X, resample_to, axis=1)
+        fs = fs * (resample_to / window)
     X = (X - X.mean(axis=1, keepdims=True)) / (X.std(axis=1, keepdims=True) + 1e-8)
     return EcgData(X=X.astype(np.float32), y=np.array(y_list, dtype=np.int64),
                    fs=fs, source="mitbih")
@@ -155,6 +176,10 @@ def load_ecg(prefer_real: bool = True, require_real: bool = False,
             synthetic. Every fallback that IS allowed still prints a `[warn]`
             line naming the reason, so provenance is never silent even when
             this is left False.
+        resample_to (via **synth_kwargs): real-data only (see
+            `load_mitbih`) — resample each captured beat down to this many
+            Xylo timesteps, independent of the capture window. Ignored for
+            synthetic, which already generates directly at the target size.
     """
     if require_real and not prefer_real:
         raise ValueError("require_real=True has no effect with prefer_real=False "
@@ -163,9 +188,15 @@ def load_ecg(prefer_real: bool = True, require_real: bool = False,
     # synthetic — so a caller probing the window/XyloSim-agreement trade-off
     # (see rockpool_models.py) gets a like-for-like comparison either way.
     window = synth_kwargs.pop("window", None)
+    resample_to = synth_kwargs.pop("resample_to", None)
     if prefer_real:
         try:
-            data = load_mitbih() if window is None else load_mitbih(window=window)
+            mitbih_kwargs = {}
+            if window is not None:
+                mitbih_kwargs["window"] = window
+            if resample_to is not None:
+                mitbih_kwargs["resample_to"] = resample_to
+            data = load_mitbih(**mitbih_kwargs)
             data.requested_real = True
             return data
         except Exception as e:  # noqa: BLE001  — any failure -> synthetic (or raise)

@@ -68,10 +68,11 @@ The full project brief is `EIA_Project_Brief.docx` in this folder.
   round(log2(tau/dt))`; our tau=20ms,dt=1ms -> dash=4 (matches mapper output).
 - **Aliases / skip connections only go toward increasing neuron id** (relevant if
   we add residual blocks for fusion).
-- **Use `spike_generation_fn=PeriodicExponential`** on the LIF neurons — the
-  SynSense-recommended surrogate for Xylo (models multiple spikes/timestep, which
-  Xylo allows up to 31 hidden). `build_xylo_snn` currently uses the default; adding
-  this should improve training + float-vs-XyloSim agreement. TODO for Claude Code.
+- **Do NOT use `spike_generation_fn=PeriodicExponential`** here. The tutorial
+  recommends it (tuned for its audio task: many input channels, short windows),
+  but A/B'd on our net (2 in / 2 out, long single-biosignal windows) it REGRESSED
+  both metrics (synthetic PPG: float 0.992->0.772, XyloSim agree 0.877->0.680).
+  Kept the default `StepPWL` surrogate on the evidence.
 - **Quantize gotcha:** the tutorial deletes `mapped_graph` and `dt` from the spec
   before `global_quantize(**spec)`. Our code passes the full dict (works on 3.1.0);
   if a version errors on unexpected kwargs, strip those two keys first.
@@ -81,6 +82,66 @@ The full project brief is `EIA_Project_Brief.docx` in this folder.
   use `channel_quantize` when co-mapping modalities.
 - Training loop that works: `Adam(net.parameters().astorch(), lr=1e-2)`, MSE (or
   CE for us), `net.reset_state()` per sample, `loss.backward()`, `step()`.
+
+## Float->XyloSim fidelity gap — ROOT CAUSE (diagnosed, see docs/ecg_quant_diagnosis.md)
+- The gap is **NOT** weight precision and **NOT** decay approximation. Ablation
+  proved it: weight-only and dynamics-only float hybrids each reproduce 96.7-100%
+  of float decisions — neither explains the real 20-44pt XyloSim disagreement. And
+  dash/decay is quantization-EXACT (LIFBitshiftTorch snaps tau during training).
+- **Real cause:** per-timestep integer STATE rounding compounding nonlinearly over
+  the window — LIF's spike-reset makes errors cascade, not average out. So on-chip
+  fidelity scales with NUMBER OF TIMESTEPS, not weight bits. (Corrects the older
+  "bit-shift decay drift" wording in build_xylo_snn comments — same "longer window
+  worse", wrong mechanism.)
+- **Design principle for all on-core modalities:** keep the window/timestep count
+  short. Longer windows are structurally worse (ECG 187 > PPG 125). When bringing
+  a new modality, resample toward the fewest timesteps that still hold the signal.
+- **Sparsity vs. fidelity tension (important):** sparser firing correlates with a
+  WORSE gap (real MIT-BIH 0.29 hidden spike rate vs synthetic ~1.5-1.8). We push
+  low spike rate for ENERGY; the diagnosis says very-sparse + long-window is bad
+  for on-chip fidelity. Treat spike-rate as a real trade-off axis, not free.
+  (Strongly supported across 3 nets but still correlational — confirm if leaned on.)
+- **Real MIT-BIH has a second, independent fault:** its output-layer bias is a
+  scale outlier (2x the largest output weight), wasting ~51% of that layer's 8-bit
+  range; its output layer diverges from float at timestep 1 (before its hidden
+  layer does). Fix = output-bias regularization, ECG-specific.
+- **Fixes ranked by evidence:** (1) timestep/window reduction, fs-matched for real
+  data; (2) margin-aware training (disagreements cluster at low decision margin);
+  (3) output-bias regularization for real ECG; (4) weight QAT LAST — ablation shows
+  little headroom there.
+- Class-harm direction is modality-specific: synthetic ECG quantization devastates
+  the minority abnormal-beat class (0.982->0.286); PPG degrades the majority class
+  instead. Always report per-class recall, not just accuracy.
+
+## Fixes were applied and measured — result is MIXED, not solved (see docs/ecg_quant_fixes_results.md)
+- Implemented all 3: `datasets.load_mitbih(resample_to=...)` (fs-matched
+  timestep control, `--resample-to` CLI flag), `--margin-reg` (Vmem-margin
+  auxiliary loss), `--bias-reg` (L2 on output bias). All off by default.
+- Reduced-budget sweep (3 restarts x 10 epochs) found real MIT-BIH
+  resample_to=187 gave agreement 0.560->0.883 — a dramatic, promising win.
+  **This did NOT reproduce at full budget** (5 restarts x 15 epochs): same
+  exact config gave 0.333, WORSE than the original 0.560 baseline.
+- **New key finding: XyloSim agreement for real MIT-BIH is highly sensitive
+  to the specific trained checkpoint**, not just the hyperparameters/config —
+  a better-trained float model (higher balanced accuracy, genuinely
+  discriminative) can be MORE fragile under quantization than a worse one.
+  Single-seed/single-restart-count comparisons are NOT reliable evidence for
+  or against a fix; needs multi-seed validation (mean +/- spread) before
+  trusting any single number, including the ones in this file.
+- Full staged (fix1 -> fix1+2 -> fix1+2+3) net effect at seed=0, full budget:
+  real ECG 0.560->0.290 (WORSE), synthetic ECG 0.733->0.733 (flat), PPG
+  0.800->0.730 (WORSE). Margin-reg was the only consistently non-negative
+  fix; bias-reg hurt every net despite a shorter-budget calibration showing
+  it help (0.05/0.01 weights were calibrated at 20 epochs, evaluated at 40 —
+  the mismatch likely over-applies the fixed-weight penalty at the longer
+  budget).
+- **Do not treat any of resample_to/margin_reg/bias_reg as solved or as new
+  defaults.** Fix 1 (timestep reduction) remains the best-evidenced lever
+  (it's the only one targeting the confirmed root mechanism from the
+  diagnosis), but "pick timesteps, done" is not yet turnkey — validate with
+  multiple seeds before relying on it. Next step if revisited: multi-seed
+  sweep, epoch-matched regularizer calibration, and/or an ensemble-of-
+  checkpoints readout instead of single-best-by-balanced-accuracy.
 
 ## Training
 - **Gradient descent** via surrogate-gradient BPTT (spikes are non-differentiable

@@ -38,6 +38,7 @@ from eia.datasets import load_ecg, load_ppg
 
 _LOADERS = {"ecg": load_ecg, "ppg": load_ppg}
 _HIDDEN_KEY = "1_LIFBitshiftTorch"
+_OUT_KEY = "3_LIFBitshiftTorch"
 
 
 def _encode_batch(X: np.ndarray, threshold: float) -> np.ndarray:
@@ -81,6 +82,25 @@ def _class_weights(y_t, n_classes: int) -> torch.Tensor:
     return weight
 
 
+def _margin_loss(vmem_mean: torch.Tensor, y: torch.Tensor, lossfn: nn.Module) -> torch.Tensor:
+    """Auxiliary loss pushing the true class's output membrane potential
+    clear of the runner-up — the docs/ecg_quant_diagnosis.md finding is that
+    float-vs-XyloSim disagreements concentrate on samples where the float
+    model's own Vmem margin (winner minus runner-up) is already small, i.e.
+    quantization noise flips only the *already-close* decisions. Reusing the
+    same class-weighted CrossEntropyLoss on Vmem (mean over time, not sum —
+    keeps the logit scale sane for softmax) is a standard, scale-robust way
+    to widen that margin: softmax-CE directly penalizes small margins, and
+    training on it as a small AUXILIARY term (not the primary objective —
+    that stays the spike-count readout XyloSim actually uses) avoids the
+    earlier-found failure mode of training on Vmem as the primary signal
+    (float accuracy soared but XyloSim agreement got much worse, since a
+    vmem-primary net can "hide" its decision below spiking threshold in a
+    way that doesn't survive quantization)."""
+    vmem_mean = vmem_mean.mean(dim=1)  # (batch, time, n_out) -> (batch, n_out)
+    return lossfn(vmem_mean, y)
+
+
 def _eval(net, R, y_t, n_classes: int):
     net.reset_state()
     with torch.no_grad():
@@ -95,7 +115,8 @@ def _eval(net, R, y_t, n_classes: int):
 def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
                     threshold: float, batch_size: int, lr: float,
                     spike_reg: float, seed: int, n_restarts: int,
-                    require_real: bool = False, loader_kwargs: dict | None = None):
+                    require_real: bool = False, loader_kwargs: dict | None = None,
+                    margin_reg: float = 0.0, bias_reg: float = 0.0):
     """Part A (train half): data card + multi-restart training with
     balanced-accuracy checkpoint selection (see build_xylo_snn for why this
     net needs restarts). Returns the trained net plus held-out tensors,
@@ -109,6 +130,19 @@ def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
     x 15 epochs) — raw accuracy can't tell a majority-collapsed solution from
     a genuinely discriminative one when one class is this rare, so neither
     the loss nor the selection metric can be allowed to only look at it.
+
+    `margin_reg` and `bias_reg` are two of the fixes from
+    `docs/ecg_quant_diagnosis.md`, both off by default: `margin_reg` adds the
+    Vmem-margin auxiliary loss (see `_margin_loss`); `bias_reg` penalizes the
+    output layer's bias magnitude (L2), targeting the diagnosed real-MIT-BIH-
+    specific failure where that bias is a scale outlier that wastes ~51% of
+    the output layer's 8-bit weight range in `global_quantize`. EXPERIMENTAL:
+    at full training budget these did not reliably improve XyloSim agreement
+    (see `docs/ecg_quant_fixes_results.md`) — real-MIT-BIH agreement turned
+    out to be highly sensitive to the specific trained checkpoint, and the
+    regularizer weights that helped at a shorter calibration budget did not
+    transfer to a longer one. Not recommended as defaults without a
+    multi-seed validation pass; kept available for further experimentation.
     """
     data = _LOADERS[modality](prefer_real=real, require_real=require_real,
                                **(loader_kwargs or {}))
@@ -156,6 +190,11 @@ def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
                 logits = out.sum(dim=1)  # sum output spikes over time -> (batch, n_out)
                 spk_rate = rec[_HIDDEN_KEY]["spikes"].mean()
                 loss = lossfn(logits, ytr_t[bidx]) + spike_reg * spk_rate
+                if margin_reg > 0:
+                    loss = loss + margin_reg * _margin_loss(
+                        rec[_OUT_KEY]["vmem"], ytr_t[bidx], lossfn)
+                if bias_reg > 0:
+                    loss = loss + bias_reg * (net[3].bias ** 2)
                 loss.backward()
                 opt.step()
             _val_acc, val_bal_acc, _val_recalls, _, _ = _eval(net, Rval, yval_t, n_classes)
@@ -320,14 +359,43 @@ def main():
     ap.add_argument("--no-combined", action="store_true",
                      help="skip the Part C one-chip co-residence check")
     ap.add_argument("--window", type=int, default=None,
-                     help="override the synthetic generator's window length "
-                          "(timesteps fed to the Xylo net) — no effect on real "
-                          "data. For probing the window/timestep vs. XyloSim-"
-                          "agreement trade-off (see rockpool_models.py notes "
-                          "on bit-shift-decay drift over long windows).")
+                     help="override the generator's/capture window length. For "
+                          "synthetic data this IS the Xylo timestep count. For "
+                          "real MIT-BIH this is the NATIVE (360 Hz) capture "
+                          "length in samples — a physiological duration, not a "
+                          "timestep budget; pair with --resample-to to pick the "
+                          "Xylo timestep count independently (see "
+                          "docs/ecg_quant_diagnosis.md and datasets.load_mitbih).")
+    ap.add_argument("--resample-to", type=int, default=None,
+                     help="real MIT-BIH only: FFT-resample each captured beat "
+                          "down to this many Xylo timesteps, rescaling fs to "
+                          "match — the fs-matched fix for the window/timestep "
+                          "vs. XyloSim-agreement trade-off (see "
+                          "docs/ecg_quant_diagnosis.md). No effect on synthetic "
+                          "data or on PPG. EXPERIMENTAL: a reduced-budget sweep "
+                          "showed a large win (resample_to=187) but it did not "
+                          "reproduce at full training budget in a single seed=0 "
+                          "run — see docs/ecg_quant_fixes_results.md before "
+                          "trusting any one result.")
+    ap.add_argument("--margin-reg", type=float, default=0.0,
+                     help="weight on the Vmem-margin auxiliary loss (0 = off). "
+                          "Targets the diagnosed fragility: float-vs-XyloSim "
+                          "disagreements concentrate on low-margin decisions. "
+                          "EXPERIMENTAL — see docs/ecg_quant_fixes_results.md.")
+    ap.add_argument("--bias-reg", type=float, default=0.0,
+                     help="weight on an L2 penalty on the output layer's bias "
+                          "(0 = off). Targets the diagnosed real-MIT-BIH-"
+                          "specific fault where that bias is a scale outlier "
+                          "wasting ~51%% of the output layer's 8-bit range. "
+                          "EXPERIMENTAL — did not transfer across training "
+                          "budgets, see docs/ecg_quant_fixes_results.md.")
     args = ap.parse_args()
     real = args.real or args.require_real
-    loader_kwargs = {"window": args.window} if args.window is not None else {}
+    loader_kwargs = {}
+    if args.window is not None:
+        loader_kwargs["window"] = args.window
+    if args.resample_to is not None:
+        loader_kwargs["resample_to"] = args.resample_to
 
     modalities = ["ecg", "ppg"] if args.modality == "both" else [args.modality]
 
@@ -337,7 +405,8 @@ def main():
             modality, real=real, epochs=args.epochs, n_hidden=args.n_hidden,
             threshold=args.threshold, batch_size=128, lr=1e-2,
             spike_reg=args.spike_reg, seed=0, n_restarts=args.n_restarts,
-            require_real=args.require_real, loader_kwargs=loader_kwargs)
+            require_real=args.require_real, loader_kwargs=loader_kwargs,
+            margin_reg=args.margin_reg, bias_reg=args.bias_reg)
         result = verify_modality(result, max_verify=args.max_verify)
         results.append(result)
 
