@@ -17,7 +17,7 @@ Additional modalities (heart & lung sounds, EEG) plug into the same pattern.
 src/eia/
   encoding.py         # delta / level-crossing event encoders (NumPy, no torch)
   energy.py           # analytical MAC-vs-SOP energy model (NumPy, no torch)
-  datasets.py         # ECG (MIT-BIH) + PPG (BIDMC) loaders, real (wfdb) or synthetic
+  datasets.py         # ECG (MIT-BIH) + PPG (BIDMC, VitalDB) loaders, real (wfdb/vitaldb) or synthetic
   report.py           # data_card(): per-dataset summary + red-flag warnings (NumPy)
   viz.py              # plots: waveforms per class, delta encoding scheme, class balance
   models.py           # spiking classifier (snnTorch) + conventional baseline
@@ -52,6 +52,7 @@ python -m eia.train                            # ECG, synthetic data — no down
 python -m eia.train --modality ppg             # PPG, synthetic data
 python -m eia.train --real                     # real MIT-BIH (needs: pip install 'eia[data]' + network)
 python -m eia.train --modality ppg --real      # real BIDMC PPG & Respiration dataset
+python -m eia.train --modality ppg --real --ppg-source vitaldb  # real VitalDB blood-loss label
 python -m eia.train --sweep                    # trace the accuracy vs. energy trade-off
 python -m eia.train --modality ppg --sweep --real
 python -m eia.train --real --require-real      # fail loudly instead of silently using synthetic
@@ -99,6 +100,8 @@ python scripts/xylo_verify.py --real                   # both, real MIT-BIH + BI
 python scripts/xylo_verify.py --real --require-real    # fail loudly, don't fall back, if real data can't load
 python scripts/xylo_verify.py --no-combined            # skip the Part C one-chip check
 python scripts/xylo_verify.py --modality ecg --window 90  # override the encoded window/timestep count
+python scripts/xylo_verify.py --modality ppg --real --ppg-source vitaldb \
+    --n-seeds 5                                # real VitalDB blood-loss label, multi-seed report
 ```
 
 For each modality: a data card, then float-model accuracy, XyloSim accuracy,
@@ -187,15 +190,27 @@ git push -u origin main
   claims should use `--real` (MIT-BIH for ECG, BIDMC for PPG) and, as you add
   modalities, the corresponding public datasets (PTB-XL, PhysioNet CinC 2016
   heart sounds, ICBHI respiratory sounds, CHB-MIT EEG).
-- **PPG label is a proxy, not a hemorrhage label.** BIDMC (ICU patients, no
-  induced hypovolemia) has no blood-loss annotation, so `--modality ppg --real`
-  labels windows by SpO2 desaturation (< 95%) as an accessible real-data stand-in
-  for physiological compromise. It proves the binary-window pipeline pattern on
-  real waveforms; it is not a validated hemorrhage/Compensatory-Reserve signal.
-  The synthetic PPG generator (`make_synthetic_ppg`) is closer in spirit to the
-  actual target: reduced pulse amplitude + blunted dicrotic notch, the
-  waveform-shape changes CRI relies on. A real hemorrhage claim needs an LBNP
-  (lower-body negative pressure) or induced-hypovolemia PPG dataset.
+- **PPG has two real-data sources now, with different caveats.** BIDMC (default,
+  `--modality ppg --real`, ICU patients, no induced hypovolemia) has no
+  blood-loss annotation, so it labels windows by SpO2 desaturation (< 95%) as an
+  accessible real-data stand-in for physiological compromise — proves the
+  binary-window pipeline pattern on real waveforms, not a validated hemorrhage
+  signal. **VitalDB** (`--ppg-source vitaldb`) adds a genuine, if coarse, blood-
+  loss label: case-level estimated blood loss (`intraop_ebl >= 500 mL` =
+  significant) from open intraoperative surgical monitoring — the first *open*
+  dataset in this repo with an actual hemorrhage-relevant label. It is **not**
+  conscious-hemorrhage ground truth: patients are anesthetized (confounds PPG),
+  EBL is a whole-case estimate (not time-aligned to the bleed), and it's split
+  **by case, not window** (`PpgData.groups`) since many correlated windows share
+  one case-level label. See `docs/vitaldb_ppg_hemorrhage_task.md` for the full
+  write-up and Part-0 field-name verification. BIDMC stays as a secondary real-
+  PPG dataset (kept, not deleted). The synthetic PPG generator
+  (`make_synthetic_ppg`) remains closest in spirit to the actual target: reduced
+  pulse amplitude + blunted dicrotic notch, the waveform-shape changes CRI
+  relies on. An LBNP (lower-body negative pressure) dataset — true induced
+  central hypovolemia in conscious subjects — is still the intended future
+  addition; VitalDB does not replace that need, it replaces the SpO2 proxy for
+  a real (if coarse) hemorrhage label.
 - **Energy is analytical**, not measured — MAC/SOP counts times per-op energy
   constants (`energy.py`, documented and swappable). Phase 2 replaces this with
   real FPGA power measurements.

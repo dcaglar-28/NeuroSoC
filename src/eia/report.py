@@ -39,6 +39,16 @@ _CARDS = {
         "SpO2-desaturation PROXY for physiological compromise — NOT a hemorrhage "
         "label. High sim-agreement here can mean 'not learning', not 'good'.",
     ),
+    ("ppg", "vitaldb"): (
+        "0 = intraop_ebl < 500 mL (case-level), 1 = intraop_ebl >= 500 mL — a "
+        "real, case-level estimated-blood-loss label (VitalDB).",
+        "REAL blood-loss label, but coarse: (1) intraoperative, ANESTHETIZED "
+        "patients — anesthesia/vasopressors/surgical context confound PPG vs. "
+        "conscious field trauma; (2) EBL is an ESTIMATE and a WHOLE-CASE "
+        "total, not time-aligned to the moment of bleeding — every window "
+        "from a case shares one label; (3) split by case, not window "
+        "(`groups`) — windows within a case are highly correlated.",
+    ),
     ("ppg", "lbnp"): (
         "Binary compromise from lower-body-negative-pressure stage / blood-volume "
         "decrement (see loader for exact threshold).",

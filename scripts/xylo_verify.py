@@ -21,6 +21,9 @@ Run from the repo root (needs `pip install "eia[xylo]"`):
     python scripts/xylo_verify.py                     # ecg + ppg, synthetic, + one-chip check
     python scripts/xylo_verify.py --modality ppg       # just PPG
     python scripts/xylo_verify.py --real               # real MIT-BIH / BIDMC (needs wfdb + network)
+    python scripts/xylo_verify.py --modality ppg --real --ppg-source vitaldb \
+        --n-seeds 5                                    # real VitalDB blood-loss label, multi-seed
+        (needs `pip install "eia[data]"`; see docs/vitaldb_ppg_hemorrhage_task.md)
 """
 
 from __future__ import annotations
@@ -31,12 +34,13 @@ import copy
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
 
 from eia import encoding, report, rockpool_models as rm, xylo_budget as xb
-from eia.datasets import load_ecg, load_ppg
+from eia.datasets import load_ecg, load_ppg, load_ppg_vitaldb
 
 _LOADERS = {"ecg": load_ecg, "ppg": load_ppg}
+_PPG_SOURCE_LOADERS = {"bidmc": load_ppg, "vitaldb": load_ppg_vitaldb}
 _HIDDEN_KEY = "1_LIFBitshiftTorch"
 _OUT_KEY = "3_LIFBitshiftTorch"
 
@@ -101,6 +105,42 @@ def _margin_loss(vmem_mean: torch.Tensor, y: torch.Tensor, lossfn: nn.Module) ->
     return lossfn(vmem_mean, y)
 
 
+def _split_data(data, seed: int):
+    """Case/subject-grouped split when `data.groups` is set (VitalDB: many
+    highly-correlated windows per surgical case sharing one label — must not
+    straddle train/val/test), plain stratified split otherwise. Prints the
+    per-split case counts (and raises on any overlap) so grouping is visible
+    in the log, not just silently trusted to the splitter."""
+    groups = getattr(data, "groups", None)
+    if groups is None:
+        Xfit, Xte, yfit, yte = train_test_split(
+            data.X, data.y, test_size=0.25, random_state=seed, stratify=data.y)
+        Xtr, Xval, ytr, yval = train_test_split(
+            Xfit, yfit, test_size=0.2, random_state=seed, stratify=yfit)
+        return Xtr, Xval, Xte, ytr, yval, yte
+
+    gss1 = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=seed)
+    fit_idx, te_idx = next(gss1.split(data.X, data.y, groups=groups))
+    Xfit, Xte = data.X[fit_idx], data.X[te_idx]
+    yfit, yte = data.y[fit_idx], data.y[te_idx]
+    groups_fit = groups[fit_idx]
+
+    gss2 = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=seed)
+    tr_idx, val_idx = next(gss2.split(Xfit, yfit, groups=groups_fit))
+    Xtr, Xval = Xfit[tr_idx], Xfit[val_idx]
+    ytr, yval = yfit[tr_idx], yfit[val_idx]
+
+    tr_cases, val_cases = set(groups_fit[tr_idx].tolist()), set(groups_fit[val_idx].tolist())
+    te_cases = set(groups[te_idx].tolist())
+    overlap = (tr_cases & val_cases) | (tr_cases & te_cases) | (val_cases & te_cases)
+    print(f"[split] case-grouped: {len(tr_cases)} train / {len(val_cases)} val "
+          f"/ {len(te_cases)} test cases"
+          + (f"  [warn] OVERLAP: {overlap}" if overlap else "  (no case overlap)"))
+    if overlap:
+        raise RuntimeError(f"case-level leakage across splits: {overlap}")
+    return Xtr, Xval, Xte, ytr, yval, yte
+
+
 def _eval(net, R, y_t, n_classes: int):
     net.reset_state()
     with torch.no_grad():
@@ -116,7 +156,8 @@ def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
                     threshold: float, batch_size: int, lr: float,
                     spike_reg: float, seed: int, n_restarts: int,
                     require_real: bool = False, loader_kwargs: dict | None = None,
-                    margin_reg: float = 0.0, bias_reg: float = 0.0):
+                    margin_reg: float = 0.0, bias_reg: float = 0.0,
+                    loader=None):
     """Part A (train half): data card + multi-restart training with
     balanced-accuracy checkpoint selection (see build_xylo_snn for why this
     net needs restarts). Returns the trained net plus held-out tensors,
@@ -144,8 +185,9 @@ def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
     transfer to a longer one. Not recommended as defaults without a
     multi-seed validation pass; kept available for further experimentation.
     """
-    data = _LOADERS[modality](prefer_real=real, require_real=require_real,
-                               **(loader_kwargs or {}))
+    loader = loader or _LOADERS[modality]
+    data = loader(prefer_real=real, require_real=require_real,
+                  **(loader_kwargs or {}))
     card = report.data_card(data)
     # Guards the exact bug this repo hit once already: a data object loaded
     # for one modality silently fed to training/reporting for another (see
@@ -154,10 +196,9 @@ def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
     n_classes = int(np.asarray(data.y).max()) + 1
 
     # Held out for final reporting — never used for model selection below.
-    Xfit, Xte, yfit, yte = train_test_split(
-        data.X, data.y, test_size=0.25, random_state=seed, stratify=data.y)
-    Xtr, Xval, ytr, yval = train_test_split(
-        Xfit, yfit, test_size=0.2, random_state=seed, stratify=yfit)
+    # Case-grouped when `data.groups` is set (VitalDB), plain-stratified
+    # otherwise — see `_split_data`.
+    Xtr, Xval, Xte, ytr, yval, yte = _split_data(data, seed)
 
     Rtr = torch.tensor(_encode_batch(Xtr, threshold))
     Rval = torch.tensor(_encode_batch(Xval, threshold))
@@ -341,6 +382,42 @@ def verify_combined(results: list, max_verify: int) -> None:
     print("=" * 60)
 
 
+def _print_multiseed_summary(modality: str, seed_results: list) -> None:
+    """Mean +/- std over seeds for float/XyloSim balanced accuracy, per-class
+    recall, and agreement. The ECG quantization-fidelity work
+    (docs/ecg_quant_fixes_results.md) found a single seed's XyloSim agreement
+    is not reliable evidence — the identical config swung from 0.883 to 0.333
+    agreement between runs — so any dataset this matters for reports a seed
+    band here, not a point estimate."""
+    n = len(seed_results)
+
+    def _stat(key):
+        vals = np.array([r[key] for r in seed_results], dtype=float)
+        return vals.mean(), vals.std()
+
+    def _stat_recalls(key):
+        arr = np.array([r[key] for r in seed_results], dtype=float)  # (n_seeds, n_classes)
+        return arr.mean(axis=0), arr.std(axis=0)
+
+    fb_m, fb_s = _stat("float_bal_acc")
+    xb_m, xb_s = _stat("xylo_bal_acc")
+    ag_m, ag_s = _stat("agreement_rate")
+    fr_m, fr_s = _stat_recalls("float_recalls")
+    xr_m, xr_s = _stat_recalls("xylo_recalls")
+
+    header = f" MULTI-SEED SUMMARY -- {modality.upper()} ({seed_results[0]['source']}) "
+    print(f"\n{header:=^60}")
+    print(f"n_seeds                  : {n}")
+    print(f"Float balanced acc       : {fb_m:.3f} +/- {fb_s:.3f}")
+    print(f"Float per-class recall   : "
+          f"{[f'{m:.3f}+/-{s:.3f}' for m, s in zip(fr_m, fr_s)]}")
+    print(f"XyloSim balanced acc     : {xb_m:.3f} +/- {xb_s:.3f}")
+    print(f"XyloSim per-class recall : "
+          f"{[f'{m:.3f}+/-{s:.3f}' for m, s in zip(xr_m, xr_s)]}")
+    print(f"Float vs. XyloSim agree  : {ag_m:.3f} +/- {ag_s:.3f}")
+    print("=" * 60)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Per-modality XyloSim verification")
     ap.add_argument("--modality", choices=["ecg", "ppg", "both"], default="both")
@@ -389,6 +466,21 @@ def main():
                           "wasting ~51%% of the output layer's 8-bit range. "
                           "EXPERIMENTAL — did not transfer across training "
                           "budgets, see docs/ecg_quant_fixes_results.md.")
+    ap.add_argument("--ppg-source", choices=["bidmc", "vitaldb"], default="bidmc",
+                     help="which real dataset backs the ppg modality (ignored "
+                          "for ecg). vitaldb = case-level intraop_ebl blood-"
+                          "loss label (see docs/vitaldb_ppg_hemorrhage_task.md); "
+                          "bidmc = SpO2-desaturation proxy (unchanged default).")
+    ap.add_argument("--max-cases", type=int, default=None,
+                     help="vitaldb only: subset of qualifying cases to pull "
+                          "(default: load_vitaldb_ppg's own default of 30).")
+    ap.add_argument("--n-seeds", type=int, default=1,
+                     help="repeat train+verify over this many seeds and report "
+                          "mean +/- std float/XyloSim balanced acc, per-class "
+                          "recall, and agreement — a single seed's XyloSim "
+                          "agreement is not reliable evidence on its own (see "
+                          "docs/ecg_quant_fixes_results.md's checkpoint-"
+                          "sensitivity finding).")
     args = ap.parse_args()
     real = args.real or args.require_real
     loader_kwargs = {}
@@ -397,18 +489,36 @@ def main():
     if args.resample_to is not None:
         loader_kwargs["resample_to"] = args.resample_to
 
+    ppg_loader_kwargs = dict(loader_kwargs)
+    if args.ppg_source == "vitaldb":
+        ppg_loader_kwargs.pop("window", None)  # vitaldb uses window_sec, not window
+        if args.max_cases is not None:
+            ppg_loader_kwargs["max_cases"] = args.max_cases
+
     modalities = ["ecg", "ppg"] if args.modality == "both" else [args.modality]
+    n_seeds = max(1, args.n_seeds)
 
     results = []
     for modality in modalities:
-        result = train_modality(
-            modality, real=real, epochs=args.epochs, n_hidden=args.n_hidden,
-            threshold=args.threshold, batch_size=128, lr=1e-2,
-            spike_reg=args.spike_reg, seed=0, n_restarts=args.n_restarts,
-            require_real=args.require_real, loader_kwargs=loader_kwargs,
-            margin_reg=args.margin_reg, bias_reg=args.bias_reg)
-        result = verify_modality(result, max_verify=args.max_verify)
-        results.append(result)
+        loader, mod_loader_kwargs = None, loader_kwargs
+        if modality == "ppg":
+            loader = _PPG_SOURCE_LOADERS[args.ppg_source]
+            mod_loader_kwargs = ppg_loader_kwargs
+
+        seed_results = []
+        for s in range(n_seeds):
+            result = train_modality(
+                modality, real=real, epochs=args.epochs, n_hidden=args.n_hidden,
+                threshold=args.threshold, batch_size=128, lr=1e-2,
+                spike_reg=args.spike_reg, seed=s, n_restarts=args.n_restarts,
+                require_real=args.require_real, loader_kwargs=mod_loader_kwargs,
+                margin_reg=args.margin_reg, bias_reg=args.bias_reg, loader=loader)
+            result = verify_modality(result, max_verify=args.max_verify)
+            seed_results.append(result)
+
+        if n_seeds > 1:
+            _print_multiseed_summary(modality, seed_results)
+        results.append(seed_results[-1])
 
     mods = [report_footprint(r) for r in results]
     print(f"\n{xb.fits_one_chip(mods)}")

@@ -218,18 +218,71 @@ Current state:
   classification** (`--modality {ecg,ppg}` on `train.py`).
 - `src/eia/`: `encoding.py` (event encoders, numpy), `energy.py` (analytical
   MAC-vs-SOP model, numpy), `datasets.py` (ECG: real MIT-BIH via wfdb + synthetic;
-  PPG: real BIDMC via wfdb + synthetic), `models.py` (snnTorch SNN + dense
-  baseline, modality-agnostic), `device.py` (MPS/CPU), `train.py` (end-to-end
-  demo + `--sweep`, both modalities).
-- 9 numpy-only unit tests pass (`pytest -q`).
+  PPG: real BIDMC via wfdb, real VitalDB via `vitaldb`, + synthetic — pick the
+  PPG real source with `--ppg-source {bidmc,vitaldb}` on `train.py` /
+  `scripts/xylo_verify.py`), `models.py` (snnTorch SNN + dense baseline,
+  modality-agnostic), `device.py` (MPS/CPU), `train.py` (end-to-end demo +
+  `--sweep`, both modalities).
+- Unit tests pass (`pytest -q`), numpy-only.
 - Verified running on the user's M-series Mac via MPS (torch 2.8), incl. `--real`
-  for both ECG (MIT-BIH) and PPG (BIDMC) with `wfdb` installed.
-- **PPG real-data label is a proxy**: BIDMC has no hemorrhage annotation, so
-  `--modality ppg --real` uses SpO2 desaturation (<95%) as a stand-in for
-  physiological compromise — proves the pipeline pattern on real waveforms, not
-  a validated hemorrhage signal. The synthetic PPG generator is the one closer
-  to the actual target (reduced amplitude + blunted dicrotic notch, mirroring
+  for ECG (MIT-BIH), PPG (BIDMC), and PPG (VitalDB) with `wfdb`/`vitaldb` installed.
+- **PPG has two real-data sources with different label quality.** BIDMC (still
+  the default) has no hemorrhage annotation, so `--modality ppg --real` uses
+  SpO2 desaturation (<95%) as a stand-in for physiological compromise — proves
+  the pipeline pattern on real waveforms, not a validated hemorrhage signal.
+  **VitalDB** (`--ppg-source vitaldb`) is a real, if coarse, hemorrhage-relevant
+  label: case-level `intraop_ebl >= 500 mL` (significant blood loss) from open
+  intraoperative monitoring — see "VitalDB PPG hemorrhage dataset" below and
+  `docs/vitaldb_ppg_hemorrhage_task.md`. Neither is conscious-field-trauma
+  ground truth; the synthetic PPG generator is still closest in spirit to the
+  actual target (reduced amplitude + blunted dicrotic notch, mirroring
   Compensatory Reserve waveform changes). See README "Notes on rigor".
+
+## VitalDB PPG hemorrhage dataset (real, open, case-level blood-loss label)
+- `datasets.load_vitaldb_ppg` streams `SNUADC/PLETH` (confirmed 500 Hz fingertip
+  pleth, present in 6157/6388 cases) and labels every window from a case by
+  that case's `intraop_ebl` (confirmed field name, non-null for 3987/6388
+  cases; 3781 cases have both). Label: `>=500 mL` = significant blood loss (a
+  common surgical transfusion-trigger threshold; ~14% of qualifying cases).
+- **`load_clinical_data(caseids=[])` returns an EMPTY frame** despite its own
+  docstring claiming that means "all cases" — pass `caseids=list(range(1,6389))`
+  explicitly (verified against the installed `vitaldb` 1.5.8; see Part 0 of the
+  task doc before trusting field/track names from memory in future work here).
+- **Case-level split, not window-level** (`PpgData.groups` = case id per
+  window): many highly-correlated segments come from one case and share one
+  case-level label, so `train.py`/`xylo_verify.py` use `GroupShuffleSplit` (not
+  `train_test_split`) whenever `data.groups is not None`, and raise if any case
+  leaks across train/val/test.
+- **Caveats baked into the data card** (`report.py`, `("ppg","vitaldb")`):
+  intraoperative/anesthetized (confounds vs. conscious trauma), EBL is a
+  whole-case ESTIMATE not time-aligned to the bleed, and expect class
+  imbalance (~14% positive at the case level, worse after small `--max-cases`
+  subsetting — check the printed class balance before trusting a result).
+- Downloads cache per-case to `data/vitaldb/` (gitignored); `--max-cases` caps
+  how many qualifying cases a run pulls. `--n-seeds` on `xylo_verify.py` reports
+  mean +/- std over seeds (float/XyloSim balanced acc, per-class recall,
+  agreement) — required here per the ECG lesson that a single seed's XyloSim
+  agreement is not reliable evidence on its own (see
+  `docs/ecg_quant_fixes_results.md`).
+- BIDMC is kept as-is, unchanged, as a secondary real-PPG dataset — VitalDB
+  supersedes it only as *the* real hemorrhage-relevant label, not as the only
+  real PPG source.
+- **Measured (multi-seed, 150 cases, 5 seeds — see docs/vitaldb_ppg_results.md):
+  the model barely learns anything from this label at the per-window level.**
+  Float balanced accuracy = 0.509 +/- 0.025 (~chance) across 5 seeds; 3 of 5
+  seeds' best-of-5-restarts training barely escapes exact majority-class
+  collapse despite the same class-weighted-loss + balanced-accuracy-selection
+  machinery that worked for real MIT-BIH ECG. Root cause is the label itself,
+  not a bug: one whole-case EBL total is stamped onto every 4-second window
+  from that case, including windows from hours before any bleeding — a single
+  pulse has no principled reason to encode a multi-hour case summary.
+  XyloSim balanced accuracy (0.600 +/- 0.186) and float-vs-XyloSim agreement
+  (0.531 +/- 0.220) both have huge seed-to-seed spread, consistent with the
+  ECG checkpoint-sensitivity finding above, worsened here by a float model
+  whose decisions are already near-chance (low margin everywhere). VitalDB is
+  a real step up in *label realism* over BIDMC's SpO2 proxy; it is not (yet)
+  a step up in *per-window learnability* — case-level pooling or a graded EBL
+  target are the follow-ups if this is revisited, not attempted here.
 
 Key finding: the SNN energy advantage is **not automatic** — it requires low
 spike rate + few timesteps (ops scale with `spike_rate x timesteps`). Training
@@ -242,10 +295,12 @@ use `--real` for meaningful accuracy.
 - `pip install -e .`; run `python -m eia.train`.
 
 ## Next planned step
-Find/add a real induced-hypovolemia or LBNP PPG dataset to replace the SpO2
-proxy label with an actual hemorrhage-relevant signal, then build a fusion head
-combining ECG + PPG over a MARCH timeline. Then heart/lung sounds, EEG, and the
-ultrasound-probe path.
+VitalDB (above) adds a real, if coarse (intraoperative/anesthetized, whole-case
+estimate), hemorrhage-relevant PPG label — but it is not the conscious-patient
+central-hypovolemia signal LBNP would give. Still find/add a real
+induced-hypovolemia or LBNP PPG dataset for that (untouched so far — do not
+conflate the two), then build a fusion head combining ECG + PPG over a MARCH
+timeline. Then heart/lung sounds, EEG, and the ultrasound-probe path.
 
 ## Working style
 Be concise and direct. Keep code in the `eia` package; keep notebooks thin so the

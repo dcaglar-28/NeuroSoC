@@ -77,3 +77,48 @@ def test_ppg_require_real_raises_instead_of_falling_back():
     with patch.object(datasets, "load_bidmc_ppg", side_effect=RuntimeError("no network")):
         with pytest.raises(RuntimeError, match="require-real"):
             datasets.load_ppg(prefer_real=True, require_real=True)
+
+
+def _fake_vitaldb_ppg(n=10):
+    return PpgData(X=np.zeros((n, 125), dtype="float32"),
+                    y=np.zeros(n, dtype="int64"), fs=125.0, source="vitaldb",
+                    groups=np.arange(n, dtype="int64"))
+
+
+def test_vitaldb_ebl_label_thresholding():
+    ebl = np.array([0.0, 100.0, 499.0, 500.0, 501.0, 5000.0])
+    labels = datasets.vitaldb_ebl_labels(ebl, ebl_threshold=500.0)
+    assert labels.tolist() == [0, 0, 0, 1, 1, 1]
+    assert labels.dtype == np.int64
+
+
+def test_vitaldb_ebl_label_custom_threshold():
+    ebl = np.array([50.0, 150.0, 300.0])
+    labels = datasets.vitaldb_ebl_labels(ebl, ebl_threshold=150.0)
+    assert labels.tolist() == [0, 1, 1]
+
+
+def test_ppg_vitaldb_real_success_sets_requested_real_and_source():
+    with patch.object(datasets, "load_vitaldb_ppg", return_value=_fake_vitaldb_ppg()):
+        d = datasets.load_ppg_vitaldb(prefer_real=True)
+        assert d.source == "vitaldb"
+        assert d.requested_real is True
+        assert d.groups is not None
+
+
+def test_ppg_vitaldb_real_failure_falls_back_but_marks_requested_real():
+    with patch.object(datasets, "load_vitaldb_ppg", side_effect=RuntimeError("no network")):
+        d = datasets.load_ppg_vitaldb(prefer_real=True, require_real=False)
+        assert d.source == "synthetic"
+        assert d.requested_real is True
+
+
+def test_ppg_vitaldb_require_real_raises_instead_of_falling_back():
+    with patch.object(datasets, "load_vitaldb_ppg", side_effect=RuntimeError("no network")):
+        with pytest.raises(RuntimeError, match="require-real"):
+            datasets.load_ppg_vitaldb(prefer_real=True, require_real=True)
+
+
+def test_ppg_vitaldb_require_real_without_prefer_real_is_a_usage_error():
+    with pytest.raises(ValueError):
+        datasets.load_ppg_vitaldb(prefer_real=False, require_real=True)

@@ -19,11 +19,12 @@ import time
 import numpy as np
 
 from . import encoding, energy, report
-from .datasets import load_ecg, load_ppg
+from .datasets import load_ecg, load_ppg, load_ppg_vitaldb
 from .device import get_device
 from .models import build_baseline, build_snn
 
 _LOADERS = {"ecg": load_ecg, "ppg": load_ppg}
+_PPG_SOURCE_LOADERS = {"bidmc": load_ppg, "vitaldb": load_ppg_vitaldb}
 
 
 def _encode_batch(X: np.ndarray, threshold: float) -> np.ndarray:
@@ -38,17 +39,18 @@ def run(real: bool = False, epochs: int = 10, hidden: int = 128,
         timesteps: int = 20, threshold: float = 0.25, batch_size: int = 128,
         lr: float = 1e-3, spike_reg: float = 5e-2, device_pref: str = "auto",
         seed: int = 0, verbose: bool = True, modality: str = "ecg",
-        require_real: bool = False):
+        require_real: bool = False, ppg_source: str = "bidmc"):
     import torch
     import torch.nn as nn
-    from sklearn.model_selection import train_test_split
+    from sklearn.model_selection import GroupShuffleSplit, train_test_split
 
     torch.manual_seed(seed)
     np.random.seed(seed)
     device = get_device(device_pref)
     print(f"[device] {device}")
 
-    data = _LOADERS[modality](prefer_real=real, require_real=require_real)
+    loader = _PPG_SOURCE_LOADERS[ppg_source] if modality == "ppg" else _LOADERS[modality]
+    data = loader(prefer_real=real, require_real=require_real)
     card = report.data_card(data, verbose=False)
     # Guards the exact bug this repo hit once already: a data object loaded
     # for one modality silently fed to training/reporting for another (see
@@ -59,8 +61,23 @@ def run(real: bool = False, epochs: int = 10, hidden: int = 128,
           f"provenance={card.provenance}  X={data.X.shape}  "
           f"pos_frac={data.y.mean():.2f}  fs={data.fs}Hz")
 
-    Xtr, Xte, ytr, yte = train_test_split(
-        data.X, data.y, test_size=0.25, random_state=seed, stratify=data.y)
+    # Case-grouped split when `data.groups` is set (VitalDB: many highly
+    # correlated windows share one case-level label) — plain stratified
+    # split otherwise, unchanged from before.
+    if getattr(data, "groups", None) is not None:
+        gss = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=seed)
+        tr_idx, te_idx = next(gss.split(data.X, data.y, groups=data.groups))
+        Xtr, Xte, ytr, yte = data.X[tr_idx], data.X[te_idx], data.y[tr_idx], data.y[te_idx]
+        tr_cases = set(data.groups[tr_idx].tolist())
+        te_cases = set(data.groups[te_idx].tolist())
+        overlap = tr_cases & te_cases
+        print(f"[split] case-grouped: {len(tr_cases)} train / {len(te_cases)} test cases"
+              + (f"  [warn] OVERLAP: {overlap}" if overlap else "  (no case overlap)"))
+        if overlap:
+            raise RuntimeError(f"case-level leakage across splits: {overlap}")
+    else:
+        Xtr, Xte, ytr, yte = train_test_split(
+            data.X, data.y, test_size=0.25, random_state=seed, stratify=data.y)
 
     # Tensors for the dense baseline (raw windows).
     Xtr_t = torch.tensor(Xtr, device=device)
@@ -147,7 +164,7 @@ def run(real: bool = False, epochs: int = 10, hidden: int = 128,
 def sweep(real: bool = False, epochs: int = 10, device_pref: str = "auto",
           timesteps_grid=(10, 20, 40), threshold_grid=(0.15, 0.25, 0.4),
           spike_reg: float = 5e-2, modality: str = "ecg",
-          require_real: bool = False):
+          require_real: bool = False, ppg_source: str = "bidmc"):
     """Trace the accuracy vs. energy trade-off across encoder/timestep settings.
 
     This is the core Phase-0 deliverable: show how sparse and how few timesteps
@@ -162,7 +179,8 @@ def sweep(real: bool = False, epochs: int = 10, device_pref: str = "auto",
         for th in threshold_grid:
             r = run(real=real, epochs=epochs, timesteps=T, threshold=th,
                     spike_reg=spike_reg, device_pref=device_pref, verbose=False,
-                    modality=modality, require_real=require_real)
+                    modality=modality, require_real=require_real,
+                    ppg_source=ppg_source)
             rows.append(r)
             marker = "  <- SNN cheaper" if r["energy_ratio"] > 1 else ""
             print(f"{T:>9} {th:>9.2f} {r['snn_acc']:>8.3f} {r['baseline_acc']:>8.3f} "
@@ -179,6 +197,12 @@ def main():
     ap.add_argument("--require-real", action="store_true",
                     help="raise instead of silently falling back to synthetic "
                          "if real data fails to load (implies --real)")
+    ap.add_argument("--ppg-source", choices=["bidmc", "vitaldb"], default="bidmc",
+                    help="which real dataset backs the ppg modality (ignored "
+                         "for ecg). vitaldb = case-level intraop_ebl blood-"
+                         "loss label; bidmc = SpO2-desaturation proxy "
+                         "(unchanged default). See "
+                         "docs/vitaldb_ppg_hemorrhage_task.md.")
     ap.add_argument("--sweep", action="store_true",
                     help="trace the accuracy/energy trade-off across settings")
     ap.add_argument("--epochs", type=int, default=10)
@@ -193,12 +217,13 @@ def main():
     if args.sweep:
         sweep(real=real, epochs=args.epochs, device_pref=args.device,
               spike_reg=args.spike_reg, modality=args.modality,
-              require_real=args.require_real)
+              require_real=args.require_real, ppg_source=args.ppg_source)
     else:
         run(real=real, epochs=args.epochs, hidden=args.hidden,
             timesteps=args.timesteps, threshold=args.threshold,
             spike_reg=args.spike_reg, device_pref=args.device,
-            modality=args.modality, require_real=args.require_real)
+            modality=args.modality, require_real=args.require_real,
+            ppg_source=args.ppg_source)
 
 
 if __name__ == "__main__":

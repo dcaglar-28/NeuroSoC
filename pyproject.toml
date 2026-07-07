@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-data = ["wfdb>=4.1"]
+data = ["wfdb>=4.1", "vitaldb>=1.5"]
 # Xylo deployment + bit-accurate simulator (SynSense Rockpool). "xylo" extra
 # pulls the XyloSim backend so you can verify on-chip behaviour without hardware.
 xylo = ["rockpool[xylo]>=3.1"]
