@@ -1,7 +1,10 @@
 """Offline unit tests for the EEG/CHB-MIT pieces (montage selection,
 band-pass, resample-to-timesteps, summary parsing, patient-alias grouping,
-provenance guarding) — no network, no torch. See docs/eeg_seizure_task.md."""
+within-patient split, provenance guarding) — no network. See
+docs/eeg_seizure_task.md."""
 
+import os
+import sys
 from unittest.mock import patch
 
 import numpy as np
@@ -9,6 +12,8 @@ import pytest
 
 from eia import case_level, datasets, report
 from eia.datasets import EegData
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
 
 def test_select_montage_shape_and_order():
@@ -177,3 +182,88 @@ def test_group_split_merges_chb21_and_chb01_no_leakage():
     assert not (tr_groups & val_groups)
     assert not (tr_groups & te_groups)
     assert not (val_groups & te_groups)
+
+
+def _fake_patient_eeg(record_labels: dict, n_windows_per_record: int = 10,
+                       patient: str = "chb01", other_patient_one_record: bool = True):
+    """Build a tiny synthetic EegData for one patient with several records,
+    each record a mix of the two classes (mirrors real CHB-MIT: a record
+    with a seizure also has plenty of non-seizure windows either side of
+    it). `record_labels`: {record_name: pos_frac} — fraction of that
+    record's windows labelled seizure (1).
+    """
+    rng = np.random.default_rng(0)
+    X_list, y_list, groups_list, rec_list = [], [], [], []
+    for rec_name, pos_frac in record_labels.items():
+        n_pos = round(n_windows_per_record * pos_frac)
+        labels = [1] * n_pos + [0] * (n_windows_per_record - n_pos)
+        for lab in labels:
+            X_list.append(rng.normal(size=(6, 16)).astype("float32"))
+            y_list.append(lab)
+            groups_list.append(patient)
+            rec_list.append(rec_name)
+
+    if other_patient_one_record:
+        # A second patient with only 1 record -- should be ineligible.
+        for lab in [0, 1, 0, 0]:
+            X_list.append(rng.normal(size=(6, 16)).astype("float32"))
+            y_list.append(lab)
+            groups_list.append("chb99")
+            rec_list.append("chb99_01")
+
+    return EegData(
+        X=np.stack(X_list), y=np.array(y_list, dtype="int64"), fs=32.0,
+        source="chbmit", groups=np.array(groups_list, dtype="<U8"),
+        record_ids=np.array(rec_list, dtype="<U16"))
+
+
+def test_eeg_patient_specific_split_no_leakage():
+    d = _fake_patient_eeg({"chb01_01": 0.3, "chb01_02": 0.3, "chb01_03": 0.0,
+                            "chb01_04": 0.0})
+    split = datasets.eeg_patient_specific_split(d, "chb01", seed=0)
+    assert split is not None
+    Xtr, Xval, Xte, ytr, yval, yte, rec_tr, rec_val, rec_te = split
+
+    te_records = set(rec_te.tolist())
+    tr_records = set(rec_tr.tolist())
+    # The TEST records must never also appear in TRAIN (val is carved from
+    # train windows, so it's allowed to share records with train by design).
+    assert not (te_records & tr_records)
+    assert len(te_records) >= 1
+    assert len(tr_records) >= 1
+
+
+def test_eeg_patient_specific_split_both_classes_in_train_and_test():
+    d = _fake_patient_eeg({"chb01_01": 0.3, "chb01_02": 0.3, "chb01_03": 0.0,
+                            "chb01_04": 0.0})
+    split = datasets.eeg_patient_specific_split(d, "chb01", seed=0)
+    assert split is not None
+    _Xtr, _Xval, _Xte, ytr, _yval, yte = split[:6]
+    assert set(np.unique(ytr).tolist()) == {0, 1}
+    assert set(np.unique(yte).tolist()) == {0, 1}
+
+
+def test_eeg_patient_specific_split_returns_none_for_single_record_patient():
+    d = _fake_patient_eeg({"chb01_01": 0.3}, other_patient_one_record=False)
+    assert datasets.eeg_patient_specific_split(d, "chb01", seed=0) is None
+
+
+def test_eeg_patient_specific_split_returns_none_for_unknown_patient():
+    d = _fake_patient_eeg({"chb01_01": 0.3, "chb01_02": 0.3})
+    assert datasets.eeg_patient_specific_split(d, "chb42", seed=0) is None
+
+
+def test_eeg_patient_specific_split_skips_when_no_permutation_balances_classes():
+    # Only ONE record has any positive windows at all -> whichever record
+    # holds the positives, the other side of the split has zero of them.
+    d = _fake_patient_eeg({"chb01_01": 1.0, "chb01_02": 0.0, "chb01_03": 0.0})
+    assert datasets.eeg_patient_specific_split(d, "chb01", seed=0) is None
+
+
+def test_eeg_eligible_patients_requires_at_least_two_records():
+    from xylo_verify import _eeg_eligible_patients
+
+    d = _fake_patient_eeg({"chb01_01": 0.3, "chb01_02": 0.3})
+    eligible = _eeg_eligible_patients(d)
+    assert "chb01" in eligible
+    assert "chb99" not in eligible  # only 1 record for chb99

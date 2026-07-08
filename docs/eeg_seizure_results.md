@@ -1,18 +1,36 @@
 # EEG seizure detection on CHB-MIT — measured results (Phase 1)
 
-Implements `docs/eeg_seizure_task.md` (MARCH "H", Phase 1). This is the
+Implements `docs/eeg_seizure_task.md` (MARCH "H", Phase 1). Part 1 is the
 subject-independent seizure-vs-non-seizure result for the new EEG modality —
 the second real-data workstream in this repo alongside ECG, reported on its
-own (never pooled with ECG/PPG results).
+own (never pooled with ECG/PPG results). Part 2 is the patient-specific
+diagnostic follow-up that disambiguates why Part 1 came back ~chance.
 
 ## Outcome, stated up front
 
-**Does NOT show cross-patient generalization at this run's data scale.**
-Float balanced accuracy is 0.525 +/- 0.030 and XyloSim balanced accuracy is
-0.500 +/- 0.028 across 5 seeds — both flat at chance, tightly so. AUROC
-(0.549 +/- 0.050 float, 0.520 +/- 0.038 XyloSim) is only marginally above 0.5.
-False-alarm rate (300-325/hour) is far above what any real seizure detector
-could ship with (clinical targets are typically <1/hour).
+**Subject-independent does NOT show cross-patient generalization** at either
+data scale tried. Float balanced accuracy is 0.525 +/- 0.030 (9 patients, 1
+seizure record each) and 0.513 +/- 0.016 (5 patients, 3 records each) — both
+flat at chance. AUROC (~0.53-0.55) is only marginally above 0.5. False-alarm
+rate (300-325/hour) is far above what any real seizure detector could ship
+with (clinical targets are typically <1/hour).
+
+**The follow-up patient-specific diagnostic (Part 2, below) narrows down
+*why*: it is ALSO flat at chance (float balanced accuracy 0.517 +/- 0.074,
+AUROC 0.524 +/- 0.097) on the exact same records subject-independent was
+tested on.** Per the diagnostic's own decision rule
+(`docs/eeg_seizure_task.md`): patient-specific learning while
+subject-independent doesn't would mean "not enough cross-patient data";
+patient-specific ALSO failing on the same data — what actually happened —
+points at the **front-end** (6-channel montage / 0.5-25 Hz band-pass / 128
+timesteps) losing the seizure signature, not simply "too few patients." Two
+of five individual patients (chb02, chb03) showed a mild positive AUROC
+(~0.59-0.60) — not nothing, but not decisive either given n=5 seeds on n=2-3
+records per patient. **This local result is itself still data-constrained**
+(2-3 records/patient, most with only one seizure event) — see
+`notebooks/02_eeg_seizure.ipynb`, built to rerun this diagnostic at a larger
+scale on Colab's faster network before treating "front-end too lossy" as
+final.
 
 **This is a different kind of negative result than VitalDB's**, and should
 not be read the same way. VitalDB's conclusion was "the label itself does not
@@ -20,14 +38,9 @@ carry a usable signal, at any granularity tried — stop revisiting it." CHB-MIT
 scalp EEG seizure detection is a well-established, decades-benchmarked
 learnable problem in the literature (that is why this task picked it — see
 `docs/eeg_seizure_task.md`'s framing: "strong physiology, excellent expert
-labels, decades of benchmarks"). The honest interpretation here is **data
-volume**, not signal absence: this run used **9 patients, 1 seizure record
-each, 718 total windows** — a small fraction of CHB-MIT's ~915 hours and 198
-seizures across 22-24 patients — because of a real, measured constraint (see
-"Why the run is this small," below). Subject-independent seizure detection
-with reasonable sensitivity typically needs many more patients and records
-per patient than were used here; this result does not contradict the
-literature, it just didn't reach the data volume where that signal shows up.
+labels, decades of benchmarks"), so a genuine data-quality dead end is
+unlikely — but this repo's own front-end choices (montage/band/timesteps) are
+now a live suspect alongside data volume, not a settled non-issue.
 
 ## Why the run is this small (a real constraint, not a shortcut)
 
@@ -189,29 +202,110 @@ modestly above that, not a strong signal on its own.)
   registered as a first-class modality (`train.py` and `scripts/
   xylo_verify.py --modality eeg`), with correct subject-independent
   evaluation machinery and the clinically appropriate metric set.
-- **Does NOT establish:** that this net, at 9 patients/718 windows, detects
-  seizures cross-patient better than chance. Given CHB-MIT's track record in
-  the literature, the most likely explanation is data volume (9 patients, 1
-  record each) rather than an absence of signal in scalp EEG for this task —
-  unlike VitalDB, this is NOT a "stop revisiting" conclusion.
-- **Patient-specific (within-patient) secondary number**: not computed in
-  this pass (optional per the task spec, gated behind time already spent on
-  the download-cost investigation above). Follow-up work if revisited:
-  compute it for contrast (expect it to look much better, and explicitly
-  label why that's not the deployment-honest number, matching the task's
-  own warning about this being the "classic CHB-MIT high-AUROC use").
+- **Does NOT establish:** that this net, at the data scales tried, detects
+  seizures better than chance — cross-patient (Part 1) or, more surprisingly,
+  within-patient (Part 2) either. Unlike VitalDB, this is NOT a "stop
+  revisiting" conclusion — the literature says this signal exists in scalp
+  EEG — but it does mean the front-end (montage/band-pass/timesteps) is now
+  an open, live question, not a settled non-issue to route around with more
+  patients alone.
+
+## Part 2 — patient-specific diagnostic (disambiguating scale vs. front-end)
+
+Implements the follow-up in `docs/eeg_seizure_task.md`: the subject-
+independent result alone can't tell "too little cross-patient data" apart
+from "the front-end destroyed the seizure signal" — both look identical from
+outside. The patient-specific diagnostic reuses the exact same pipeline
+(montage, band-pass, resample, delta encoding, `build_xylo_snn`,
+class-weighted CE, balanced-accuracy checkpoint selection) but splits WITHIN
+one patient — by RECORD, never by window, so a seizure event's neighbouring
+windows can't straddle train/test (`datasets.eeg_patient_specific_split`).
+**This is a diagnostic upper bound, not the deployment metric** — CHB-MIT's
+classic high-AUROC results in the literature are usually patient-specific and
+do not reflect a device that has never seen the patient.
+
+### Run configuration
+
+5 patients with >=2 cached records each (`chb01, chb02, chb03, chb05, chb06`
+— `chb07-10` were excluded here for having only 1 cached record, insufficient
+to hold one out; see `run_eeg_patient_specific`'s eligibility check), 3
+seizure + 1 non-seizure record per patient (1072 windows total), 5 seeds x 5
+restarts x 20 epochs. For a fair comparison, subject-independent was ALSO
+rerun on this exact same 5-patient/1072-window pool (not the original
+9-patient/718-window run above) so both numbers below come from identical
+data.
+
+```bash
+# patient-specific
+python scripts/xylo_verify.py --modality eeg --real --require-real \
+  --split patient-specific --eeg-subjects chb01,chb02,chb03,chb05,chb06 \
+  --epochs 20 --n-restarts 5 --n-seeds 5 --max-verify 300
+
+# subject-independent, same 5-patient pool, for direct comparison
+python scripts/xylo_verify.py --modality eeg --real --require-real \
+  --split subject-independent --eeg-subjects chb01,chb02,chb03,chb05,chb06 \
+  --epochs 20 --n-restarts 5 --n-seeds 5 --max-verify 300 --no-combined
+```
+
+### Per-patient results (patient-specific, float, mean +/- std over 5 seeds)
+
+| Patient | Balanced acc | AUROC | AUPRC | Sensitivity | Specificity | FA/hour |
+|---|---|---|---|---|---|---|
+| chb01 | 0.473 +/- 0.100 | 0.437 +/- 0.147 | 0.120 +/- 0.037 | 0.300 +/- 0.257 | 0.647 +/- 0.177 | 318 +/- 159 |
+| chb02 | 0.565 +/- 0.032 | 0.588 +/- 0.022 | 0.312 +/- 0.025 | 0.590 +/- 0.260 | 0.540 +/- 0.228 | 414 +/- 205 |
+| chb03 | 0.560 +/- 0.042 | 0.596 +/- 0.049 | 0.273 +/- 0.061 | 0.381 +/- 0.174 | 0.740 +/- 0.215 | 234 +/- 194 |
+| chb05 | 0.484 +/- 0.015 | 0.491 +/- 0.040 | 0.321 +/- 0.017 | 0.307 +/- 0.156 | 0.660 +/- 0.157 | 306 +/- 141 |
+| chb06 | 0.503 +/- 0.085 | 0.509 +/- 0.055 | 0.192 +/- 0.030 | 0.383 +/- 0.172 | 0.623 +/- 0.215 | 339 +/- 193 |
+
+### Diagnostic comparison (same 5-patient/1072-window pool, float)
+
+| Split | Balanced acc | AUROC |
+|---|---|---|
+| **Subject-independent** (2 train / 1 val / 2 test patients) | 0.513 +/- 0.016 | 0.527 +/- 0.030 |
+| **Patient-specific** (record-held-out within each patient; pooled over 5 patients x 5 seeds = 25 results) | 0.517 +/- 0.074 | 0.524 +/- 0.097 |
+
+### Verdict
+
+Per `run_eeg_patient_specific`'s own decision rule
+(`(patient_specific_mean - std) > 0.5 and AUROC_mean > 0.6`): **NOT MET** —
+patient-specific balanced accuracy's lower band (0.517 - 0.074 = 0.443) sits
+below chance, and its AUROC (0.524) doesn't clear 0.6. **Patient-specific is
+ALSO ~chance on these same records.** Per the task's framework, this points
+at the front-end (montage/band-pass/timestep budget) as the more likely
+bottleneck, ahead of pure data volume — though the caveat below means this
+isn't yet the final word.
+
+**Caveat — this diagnostic is itself still data-constrained.** 5 patients
+with 2-3 records each (mostly a single seizure event per patient) is a small
+base for "does more data within one patient help" — the two patients with
+the most seizure-record diversity (chb02, chb03: AUROC ~0.59-0.60) are also
+the ones showing the mildest positive signal, which is at least directionally
+consistent with "more within-patient data would help," not decisively
+against it. `notebooks/02_eeg_seizure.ipynb` is built to rerun this exact
+diagnostic with every available seizure record for these patients (CHB-MIT
+has 3-7 per subject) on a faster connection — that is the run to trust before
+treating "front-end too lossy" as the final answer over "still not enough
+data, even within-patient."
 
 ## Follow-ups if this is revisited
 
-1. **More data, patiently**: rerun with more subjects and more
-   records/subject (`--eeg-seizure-records`, `--eeg-nonseizure-records`,
-   `--eeg-subjects`) when there's a larger time/network budget — the
-   `data/chbmit/` cache means this can be done incrementally across sessions
-   rather than repeating any download.
-2. **Timestep sweep**: try `--resample-to` values other than 128, following
-   the ECG lesson that fewer timesteps can help XyloSim fidelity — not done
-   here due to the data-volume-first priority.
-3. **Investigate the `read_edf` "math domain error`** for chb12/13/14/16/
+1. **Run `notebooks/02_eeg_seizure.ipynb` on Colab (do this first)**: pulls
+   every available seizure record for the 9 loadable subjects on a faster
+   connection, runs both splits on the same larger pool, and prints the
+   verdict — the most direct way to firm up "front-end too lossy" vs. "still
+   not enough data" from Part 2 above. Verified to run end-to-end locally at
+   reduced scale before being written up here.
+2. **If the notebook confirms front-end too lossy**: revisit
+   `datasets.EEG_MONTAGE` (try 8 channels — the exact Xylo ceiling), the
+   band-pass range, or `resample_to` (try more than 128 timesteps, trading
+   off against the ECG quantization-fidelity lesson that fewer timesteps
+   usually helps on-chip agreement — worth an explicit sweep here, not
+   assumed).
+3. **If the notebook confirms scale problem instead**: keep pulling more
+   subjects/records/subject (`--eeg-seizure-records`,
+   `--eeg-nonseizure-records`, `--eeg-subjects`) — the `data/chbmit/` cache
+   means this is incremental across sessions, not repeated download.
+4. **Investigate the `read_edf` "math domain error"** for chb12/13/14/16/
    17/18/19/21 (an 8-subject loss, including the chb01/chb21 duplicate-patient
    case) — likely a wfdb parsing edge case worth a small, separate
    investigation (e.g. comparing an `.edf` field wfdb chokes on across a
@@ -221,7 +315,17 @@ modestly above that, not a strong signal on its own.)
 
 ```bash
 pip install "eia[data,xylo]"
+
+# subject-independent (deployment metric)
 python scripts/xylo_verify.py --modality eeg --real --require-real \
   --eeg-seizure-records 1 --eeg-nonseizure-records 0 \
   --epochs 20 --n-restarts 5 --n-seeds 5 --max-verify 300 --no-combined
+
+# patient-specific diagnostic (Part 2) -- needs >=2 cached records/patient
+python scripts/xylo_verify.py --modality eeg --real --require-real \
+  --split patient-specific --eeg-subjects chb01,chb02,chb03,chb05,chb06 \
+  --epochs 20 --n-restarts 5 --n-seeds 5 --max-verify 300
+
+# both splits together, at Colab scale, with the explicit verdict:
+# notebooks/02_eeg_seizure.ipynb
 ```

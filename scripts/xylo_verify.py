@@ -24,6 +24,9 @@ Run from the repo root (needs `pip install "eia[xylo]"`):
     python scripts/xylo_verify.py --modality ppg --real --ppg-source vitaldb \
         --n-seeds 5                                    # real VitalDB blood-loss label, multi-seed
         (needs `pip install "eia[data]"`; see docs/vitaldb_ppg_hemorrhage_task.md)
+    python scripts/xylo_verify.py --modality eeg --real --require-real \
+        --split patient-specific --n-seeds 5           # diagnostic upper bound, NOT the
+        deployment metric — see docs/eeg_seizure_task.md and run_eeg_patient_specific()
 """
 
 from __future__ import annotations
@@ -139,7 +142,7 @@ def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
                     spike_reg: float, seed: int, n_restarts: int,
                     require_real: bool = False, loader_kwargs: dict | None = None,
                     margin_reg: float = 0.0, bias_reg: float = 0.0,
-                    loader=None):
+                    loader=None, split_fn=None, card_verbose: bool = True):
     """Part A (train half): data card + multi-restart training with
     balanced-accuracy checkpoint selection (see build_xylo_snn for why this
     net needs restarts). Returns the trained net plus held-out tensors,
@@ -170,7 +173,7 @@ def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
     loader = loader or _LOADERS[modality]
     data = loader(prefer_real=real, require_real=require_real,
                   **(loader_kwargs or {}))
-    card = report.data_card(data)
+    card = report.data_card(data, verbose=card_verbose)
     # Guards the exact bug this repo hit once already: a data object loaded
     # for one modality silently fed to training/reporting for another (see
     # notebooks/01_ecg_snn.ipynb history). Cheap and always-on.
@@ -178,10 +181,13 @@ def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
     n_classes = int(np.asarray(data.y).max()) + 1
 
     # Held out for final reporting — never used for model selection below.
-    # Case-grouped when `data.groups` is set (VitalDB), plain-stratified
-    # otherwise — see `eia.case_level.split_data`.
+    # Case-grouped when `data.groups` is set (VitalDB/EEG subject-independent),
+    # plain-stratified otherwise — see `eia.case_level.split_data`. Callers
+    # needing a different split (e.g. the EEG within-patient diagnostic) pass
+    # `split_fn(data, seed) -> same 9-tuple shape` to override this.
+    split_fn = split_fn or case_level.split_data
     Xtr, Xval, Xte, ytr, yval, yte, _groups_tr, _groups_val, _groups_te = \
-        case_level.split_data(data, seed)
+        split_fn(data, seed)
 
     Rtr = torch.tensor(_encode_batch(Xtr, threshold))
     Rval = torch.tensor(_encode_batch(Xval, threshold))
@@ -478,6 +484,169 @@ def _print_multiseed_summary(modality: str, seed_results: list) -> None:
     print("=" * 60)
 
 
+def _eeg_eligible_patients(data, min_records: int = 2) -> list:
+    """Patients with >=`min_records` distinct CHB-MIT records — needed to
+    hold at least one whole record out for a record-disjoint within-patient
+    test split (see `datasets.eeg_patient_specific_split`)."""
+    patients = sorted(set(data.groups.tolist()))
+    return [p for p in patients
+            if len(set(data.record_ids[data.groups == p].tolist())) >= min_records]
+
+
+def run_eeg_patient_specific(data, epochs: int, n_hidden: int, threshold: float,
+                              batch_size: int, lr: float, spike_reg: float,
+                              n_restarts: int, n_seeds: int, max_verify: int,
+                              test_frac: float = 0.3, val_frac: float = 0.2) -> list:
+    """Patient-specific EEG diagnostic (docs/eeg_seizure_task.md): the exact
+    same pipeline as the subject-independent path (montage, band-pass,
+    resample, delta encoding, `build_xylo_snn`, class-weighted CE,
+    balanced-accuracy checkpoint selection) — the ONLY thing that changes is
+    the split, which holds out whole RECORDS within one patient instead of
+    whole PATIENTS. This disambiguates "too little cross-patient data" (this
+    should learn) from "the front-end destroyed the seizure signal" (this
+    should also fail). It is a diagnostic upper bound, NOT the deployment
+    metric — never report it as the headline number.
+
+    `data` is loaded ONCE by the caller and reused for every (patient, seed)
+    combination here (no re-downloading per patient).
+    """
+    from eia import datasets
+
+    all_patients = sorted(set(data.groups.tolist()))
+    eligible = _eeg_eligible_patients(data)
+    skipped = [p for p in all_patients if p not in eligible]
+    print(f"\n[eeg-patient-specific] eligible patients (>=2 records): {eligible}")
+    if skipped:
+        print(f"[eeg-patient-specific] skipped (only 1 record, can't hold "
+              f"one out for a record-disjoint test split): {skipped}")
+
+    results = []
+    for patient in eligible:
+        patient_results = []
+        for seed in range(n_seeds):
+            split = datasets.eeg_patient_specific_split(
+                data, patient, seed, test_frac=test_frac, val_frac=val_frac)
+            if split is None:
+                print(f"[warn] eeg-patient-specific {patient} seed {seed}: "
+                      f"no record permutation gave both classes on both "
+                      f"sides; skipping this (patient, seed).")
+                continue
+
+            def _fixed_split_fn(_data, _seed, _split=split):
+                return _split
+
+            result = train_modality(
+                "eeg", real=True, epochs=epochs, n_hidden=n_hidden,
+                threshold=threshold, batch_size=batch_size, lr=lr,
+                spike_reg=spike_reg, seed=seed, n_restarts=n_restarts,
+                loader=lambda **_kw: data, split_fn=_fixed_split_fn,
+                card_verbose=False)
+            result = verify_modality(result, max_verify=max_verify)
+            result["patient"] = patient
+            patient_results.append(result)
+            results.append(result)
+
+        if patient_results:
+            _print_eeg_patient_row(patient, patient_results)
+        else:
+            print(f"[eeg-patient-specific] {patient}: no seed produced a "
+                  f"usable split; skipped entirely.")
+
+    return results
+
+
+def _stat_over(results: list, key: str):
+    vals = np.array([r[key] for r in results], dtype=float)
+    return float(np.nanmean(vals)), float(np.nanstd(vals))
+
+
+def _stat_eeg_over(results: list, net_key: str, metric_key: str):
+    vals = np.array([r[net_key][metric_key] for r in results], dtype=float)
+    return float(np.nanmean(vals)), float(np.nanstd(vals))
+
+
+def _print_eeg_patient_row(patient: str, seed_results: list) -> None:
+    fb_m, fb_s = _stat_over(seed_results, "float_bal_acc")
+    auroc_m, auroc_s = _stat_eeg_over(seed_results, "float_eeg_metrics", "auroc")
+    auprc_m, auprc_s = _stat_eeg_over(seed_results, "float_eeg_metrics", "auprc")
+    sens_m, sens_s = _stat_eeg_over(seed_results, "float_eeg_metrics", "sensitivity")
+    spec_m, spec_s = _stat_eeg_over(seed_results, "float_eeg_metrics", "specificity")
+    fa_m, fa_s = _stat_eeg_over(seed_results, "float_eeg_metrics", "fa_per_hour")
+    print(f"[eeg-patient-specific] {patient} (n_seeds={len(seed_results)}): "
+          f"float bal_acc={fb_m:.3f}+/-{fb_s:.3f}  AUROC={auroc_m:.3f}+/-{auroc_s:.3f}  "
+          f"AUPRC={auprc_m:.3f}+/-{auprc_s:.3f}  sens={sens_m:.3f}+/-{sens_s:.3f}  "
+          f"spec={spec_m:.3f}+/-{spec_s:.3f}  FA/hr={fa_m:.1f}+/-{fa_s:.1f}")
+
+
+def print_eeg_patient_specific_summary(results: list) -> dict:
+    """Overall patient-specific summary: mean +/- std pooling every
+    (patient, seed) result together — captures both within-patient-seed
+    noise and between-patient variation. Returns the summary (for
+    `print_eeg_diagnostic_verdict`); empty dict if nothing usable ran."""
+    if not results:
+        print("\n[eeg-patient-specific] no patient/seed combination produced "
+              "a usable split — nothing to summarize.")
+        return {}
+
+    n_patients = len(set(r["patient"] for r in results))
+    fb = _stat_over(results, "float_bal_acc")
+    auroc = _stat_eeg_over(results, "float_eeg_metrics", "auroc")
+    auprc = _stat_eeg_over(results, "float_eeg_metrics", "auprc")
+    sens = _stat_eeg_over(results, "float_eeg_metrics", "sensitivity")
+    spec = _stat_eeg_over(results, "float_eeg_metrics", "specificity")
+    fa = _stat_eeg_over(results, "float_eeg_metrics", "fa_per_hour")
+
+    print(f"\n{' PATIENT-SPECIFIC DIAGNOSTIC SUMMARY (EEG) ':=^60}")
+    print(f"n_patients x seeds       : {n_patients} patients, "
+          f"{len(results)} (patient,seed) results")
+    print(f"Float balanced acc       : {fb[0]:.3f} +/- {fb[1]:.3f}")
+    print(f"Float AUROC / AUPRC      : {auroc[0]:.3f}+/-{auroc[1]:.3f} / "
+          f"{auprc[0]:.3f}+/-{auprc[1]:.3f}")
+    print(f"Float sensitivity/specif.: {sens[0]:.3f}+/-{sens[1]:.3f} / "
+          f"{spec[0]:.3f}+/-{spec[1]:.3f}")
+    print(f"Float false alarms/hour  : {fa[0]:.1f} +/- {fa[1]:.1f}")
+    print("NOTE: this is a DIAGNOSTIC upper-bound number, not the deployment "
+          "metric (docs/eeg_seizure_task.md) — the headline number for this "
+          "device is the subject-independent split.")
+    print("=" * 60)
+    return {"bal_acc": fb, "auroc": auroc, "auprc": auprc,
+            "n_patients": n_patients, "n_results": len(results)}
+
+
+def print_eeg_diagnostic_verdict(patient_specific_summary: dict,
+                                  subject_independent_bal_acc: tuple) -> None:
+    """Explicit verdict distinguishing the two possible outcomes
+    (docs/eeg_seizure_task.md): patient-specific learning while
+    subject-independent doesn't means a SCALE problem (more patients is the
+    fix); patient-specific also failing on the same records means the
+    front-end is too lossy (revisit montage/band/timesteps first)."""
+    print(f"\n{' VERDICT ':=^60}")
+    if not patient_specific_summary:
+        print("Patient-specific diagnostic produced no usable result (not "
+              "enough multi-record patients) — inconclusive.")
+        print("=" * 60)
+        return
+
+    ps_m, ps_s = patient_specific_summary["bal_acc"]
+    auroc_m, _auroc_s = patient_specific_summary["auroc"]
+    si_m, si_s = subject_independent_bal_acc
+    patient_specific_learns = (ps_m - ps_s) > 0.5 and auroc_m > 0.6
+
+    print(f"Patient-specific    float balanced acc: {ps_m:.3f} +/- {ps_s:.3f}")
+    print(f"Subject-independent float balanced acc: {si_m:.3f} +/- {si_s:.3f}")
+    if patient_specific_learns:
+        print("Patient-specific LEARNS (clearly above chance) while "
+              "subject-independent does not -> SCALE problem: the front end "
+              "preserves a usable seizure signature; cross-patient "
+              "generalization needs more patients/records, not a pipeline "
+              "redesign.")
+    else:
+        print("Patient-specific is ALSO ~chance on these same records -> "
+              "front-end too lossy: revisit montage/band-pass/timestep "
+              "budget before pulling more data.")
+    print("=" * 60)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Per-modality XyloSim verification")
     ap.add_argument("--modality", choices=["ecg", "ppg", "eeg", "both"], default="both")
@@ -562,6 +731,16 @@ def main():
                           "for background diversity (default: load_chbmit's "
                           "own default of 1). Set to 0 to skip entirely and "
                           "cut download volume.")
+    ap.add_argument("--split", choices=["subject-independent", "patient-specific"],
+                     default="subject-independent",
+                     help="eeg only: 'subject-independent' (default, the "
+                          "deployment metric — split by patient) or "
+                          "'patient-specific' (a DIAGNOSTIC, not the "
+                          "deployment metric — split by record within each "
+                          "patient, to disambiguate 'too little cross-"
+                          "patient data' from 'the front-end destroyed the "
+                          "seizure signal'; see docs/eeg_seizure_task.md). "
+                          "Ignored for ecg/ppg.")
     args = ap.parse_args()
     real = args.real or args.require_real
     loader_kwargs = {}
@@ -588,8 +767,21 @@ def main():
     if args.eeg_nonseizure_records is not None:
         eeg_loader_kwargs["nonseizure_records_per_subject"] = args.eeg_nonseizure_records
 
-    modalities = ["ecg", "ppg"] if args.modality == "both" else [args.modality]
     n_seeds = max(1, args.n_seeds)
+
+    if args.modality == "eeg" and args.split == "patient-specific":
+        loader = _LOADERS["eeg"]
+        data = loader(prefer_real=real, require_real=args.require_real, **eeg_loader_kwargs)
+        card = report.data_card(data)
+        report.assert_provenance(card, data, "eeg")
+        patient_results = run_eeg_patient_specific(
+            data, epochs=args.epochs, n_hidden=args.n_hidden, threshold=args.threshold,
+            batch_size=128, lr=1e-2, spike_reg=args.spike_reg, n_restarts=args.n_restarts,
+            n_seeds=n_seeds, max_verify=args.max_verify)
+        print_eeg_patient_specific_summary(patient_results)
+        return
+
+    modalities = ["ecg", "ppg"] if args.modality == "both" else [args.modality]
 
     results = []
     for modality in modalities:

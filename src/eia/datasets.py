@@ -64,6 +64,13 @@ class EegData:
     # subject-independent, so every consumer must split by patient, never by
     # window (the VitalDB case-leakage lesson, same mechanism as PpgData.groups).
     groups: np.ndarray | None = None
+    # Source record id per window (e.g. "chb01_03"). Finer-grained than
+    # `groups`: used by `eeg_patient_specific_split` to hold out whole
+    # RECORDS (not random windows) within one patient for the patient-
+    # specific diagnostic (docs/eeg_seizure_task.md) — a within-patient
+    # window-random split would leak the same seizure event's neighbouring
+    # windows across train/test.
+    record_ids: np.ndarray | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -759,7 +766,7 @@ def load_chbmit(
     rng = np.random.default_rng(seed)
     window_native = int(round(window_sec * EEG_NATIVE_FS))
 
-    X_list, y_list, group_list = [], [], []
+    X_list, y_list, group_list, record_list = [], [], [], []
     for subject in subjects:
         try:
             summary = _fetch_chbmit_summary(subject, cache_dir)
@@ -795,6 +802,7 @@ def load_chbmit(
                 X_list.append(seg.astype(np.float32))
                 y_list.append(1 if w in pos_w else 0)
                 group_list.append(patient)
+                record_list.append(record)
 
     if not X_list:
         raise RuntimeError("No EEG windows extracted from CHB-MIT.")
@@ -808,7 +816,79 @@ def load_chbmit(
 
     return EegData(X=X.astype(np.float32), y=np.array(y_list, dtype=np.int64),
                     fs=fs_eff, source="chbmit",
-                    groups=np.array(group_list, dtype="<U8"))
+                    groups=np.array(group_list, dtype="<U8"),
+                    record_ids=np.array(record_list, dtype="<U16"))
+
+
+def eeg_patient_specific_split(data: "EegData", patient: str, seed: int,
+                                test_frac: float = 0.3, val_frac: float = 0.2):
+    """Within-patient train/val/test split for the patient-specific EEG
+    diagnostic (docs/eeg_seizure_task.md follow-up: disambiguating "too
+    little cross-patient data" from "the front-end destroyed the seizure
+    signal"). Holds out whole RECORDS for test — never individual windows —
+    so a seizure event's neighbouring windows can't straddle train/test (the
+    within-patient analogue of the case/patient-level leakage guard used
+    everywhere else in this repo). `val` is carved window-level from the
+    training records only, for checkpoint selection — that's fine because it
+    is never the reported metric, only the record-disjoint test set is.
+
+    Returns the same 9-tuple shape as `case_level.split_data`
+    (Xtr, Xval, Xte, ytr, yval, yte, groups_tr, groups_val, groups_te), or
+    `None` if this patient can't support a class-balanced record split:
+    fewer than 2 distinct records, or no permutation of records (tried up to
+    10 times) puts both classes in both the train and test halves.
+    """
+    if data.record_ids is None or data.groups is None:
+        raise ValueError("eeg_patient_specific_split needs data.record_ids and data.groups")
+
+    mask = data.groups == patient
+    idx_all = np.where(mask)[0]
+    if idx_all.size == 0:
+        return None
+    rec = data.record_ids[idx_all]
+    y = data.y[idx_all]
+    unique_records = np.unique(rec)
+    if unique_records.size < 2:
+        return None
+
+    rng = np.random.default_rng(seed)
+    te_mask = tr_mask = None
+    for _attempt in range(10):
+        perm = rng.permutation(unique_records)
+        n_test = max(1, round(len(perm) * test_frac))
+        n_test = min(n_test, len(perm) - 1)  # always leave >=1 record for train
+        test_records = set(perm[:n_test].tolist())
+        train_records = set(perm[n_test:].tolist())
+        cand_te_mask = np.isin(rec, list(test_records))
+        cand_tr_mask = np.isin(rec, list(train_records))
+        if np.unique(y[cand_te_mask]).size > 1 and np.unique(y[cand_tr_mask]).size > 1:
+            te_mask, tr_mask = cand_te_mask, cand_tr_mask
+            break
+    if te_mask is None:
+        return None  # no record permutation gave both classes on both sides
+
+    te_idx = idx_all[te_mask]
+    tr_idx_full = idx_all[tr_mask]
+
+    # Window-level split of the TRAINING records only, for checkpoint
+    # selection — record-disjointness doesn't matter here since val is
+    # never part of the reported test metric.
+    y_tr_full = data.y[tr_idx_full]
+    if np.unique(y_tr_full).size > 1 and tr_idx_full.size >= 4:
+        from sklearn.model_selection import train_test_split
+        tr_idx, val_idx = train_test_split(
+            tr_idx_full, test_size=val_frac, random_state=seed, stratify=y_tr_full)
+    else:
+        tr_idx, val_idx = tr_idx_full, tr_idx_full
+
+    # The last 3 slots match `case_level.split_data`'s shape (train_modality
+    # only needs *a* grouping value there, unused for training itself) but
+    # carry RECORD ids here, not patient ids — within one patient the patient
+    # id is constant/uninformative, whereas the record id is what this split
+    # actually partitioned on, and is what a leakage check should verify.
+    return (data.X[tr_idx], data.X[val_idx], data.X[te_idx],
+            data.y[tr_idx], data.y[val_idx], data.y[te_idx],
+            data.record_ids[tr_idx], data.record_ids[val_idx], data.record_ids[te_idx])
 
 
 def make_synthetic_eeg(

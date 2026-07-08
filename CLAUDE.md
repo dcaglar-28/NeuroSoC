@@ -317,9 +317,12 @@ open labels.
 - **C (Circulation) — DONE.** ECG arrhythmia on real MIT-BIH is the one modality
   genuinely learning on real data (float balanced acc 0.845). On-chip XyloSim
   fidelity (~0.56) is the open engineering gap, not a data gap.
-- **H (Head) — Phase 1 EEG pipeline built and Xylo-verified; cross-patient
-  result is ~chance at the data scale run so far (data-volume-limited, not a
-  data-quality dead end like VitalDB — see docs/eeg_seizure_results.md).**
+- **H (Head) — Phase 1 EEG pipeline built and Xylo-verified; both
+  subject-independent AND the patient-specific diagnostic are ~chance at the
+  local data scale run so far — points toward the front-end (montage/band/
+  timesteps) as a live suspect, not just "need more patients." See
+  docs/eeg_seizure_results.md and notebooks/02_eeg_seizure.ipynb (Colab, run
+  this before treating "front-end too lossy" as final).**
   Split into two independent workstreams:
   - **EEG:** seizure detection on **CHB-MIT** (open, WFDB-via-`read_edf`,
     expert seizure labels, decades of benchmarks). Task spec:
@@ -328,27 +331,40 @@ open labels.
     timesteps → delta encoder → 12 spike channels → LIF SNN, `n_in=12` →
     XyloSim; `input 12/16` in the footprint check, margin under the 16-channel
     ceiling). Subject-independent split (patient-grouped, chb21 folded into
-    chb01) is wired and leakage-checked. **Measured (9 patients, 1 seizure
-    record each — 718 windows, 5 seeds): float balanced acc 0.525 +/- 0.030,
-    XyloSim 0.500 +/- 0.028, both flat at chance; AUROC ~0.52-0.55; false
-    alarms 300-325/hour (unusable as-is).** Root cause is believed to be data
-    volume (9 patients/1 record each is far below CHB-MIT's ~22-24 patients),
-    not signal absence — CHB-MIT seizure detection is well-established as
-    learnable in the literature, unlike VitalDB. The run was deliberately
-    kept this small because PhysioNet download throughput for CHB-MIT's ~40MB
-    EDF files varied wildly (4-25+ min/record) during this session; two
-    larger attempts (13 then 9 subjects x up to 3 records) were killed
-    mid-run as impractically slow. `data/chbmit/` caches every record
-    downloaded so far — rerunning with more subjects/records via
-    `--eeg-subjects`/`--eeg-seizure-records`/`--eeg-nonseizure-records` is the
-    natural next step, not a re-download. Also found: `chb12/13/14/16/17/18/
-    19/21` all fail to load via `wfdb.io.convert.edf.read_edf` ("math domain
-    error") — a real, reproducible parser limitation, not guessed; excluded
-    from `datasets.DEFAULT_EEG_SUBJECTS`. Metrics reported are
-    AUROC/AUPRC/sensitivity/specificity/FA-per-hour, NOT accuracy (extreme
-    imbalance), per the task spec. Caveat: CHB-MIT is pediatric epilepsy, not
-    field TBI. Phase 2 = TUSZ (registration-gated) + Siena generalization; Phase 3
-    = TBI spectral screening (slowing, burst suppression) — a different task.
+    chb01) is wired and leakage-checked. **Part 1 measured (9 patients, 1
+    seizure record each — 718 windows, 5 seeds): float balanced acc
+    0.525 +/- 0.030, XyloSim 0.500 +/- 0.028, both flat at chance; AUROC
+    ~0.52-0.55; false alarms 300-325/hour (unusable as-is).**
+    **Part 2 — patient-specific diagnostic** (`--split patient-specific`,
+    `datasets.eeg_patient_specific_split`: holds out whole RECORDS within one
+    patient, never windows, to avoid within-patient temporal leakage) was
+    added specifically to disambiguate "too little cross-patient data" from
+    "the front-end destroyed the seizure signal." On the same 5-patient/
+    1072-window pool, subject-independent (0.513 +/- 0.016 bal acc) and
+    patient-specific (0.517 +/- 0.074 bal acc, AUROC 0.524 +/- 0.097, pooled
+    over 5 patients x 5 seeds) came back statistically indistinguishable —
+    **patient-specific is ALSO ~chance**, which per the diagnostic's own
+    decision rule points at the front-end as the more likely bottleneck, not
+    pure data volume. Caveat: this diagnostic run is itself still
+    data-constrained (2-3 records/patient); two patients with more seizure-
+    record diversity (chb02, chb03) showed a mild positive AUROC (~0.59-0.60)
+    — directionally against "front-end is hopeless," not decisive either way.
+    `notebooks/02_eeg_seizure.ipynb` (Colab-ready, verified to execute
+    end-to-end locally at reduced scale) reruns both splits with every
+    available seizure record per subject on a faster connection — run this
+    before committing to a front-end redesign. Local network was the binding
+    constraint throughout (PhysioNet throughput for CHB-MIT's ~40MB EDF files
+    varied 4-25+ min/record this session; several larger download attempts
+    were killed mid-run as impractically slow) — `data/chbmit/` caches every
+    record pulled so far, so scaling up is incremental, not a re-download.
+    Also found: `chb12/13/14/16/17/18/19/21` all fail to load via
+    `wfdb.io.convert.edf.read_edf` ("math domain error") — a real,
+    reproducible parser limitation, not guessed; excluded from
+    `datasets.DEFAULT_EEG_SUBJECTS`. Metrics reported are AUROC/AUPRC/
+    sensitivity/specificity/FA-per-hour, NOT accuracy (extreme imbalance),
+    per the task spec. Caveat: CHB-MIT is pediatric epilepsy, not field TBI.
+    Phase 2 = TUSZ (registration-gated) + Siena generalization; Phase 3 = TBI
+    spectral screening (slowing, burst suppression) — a different task.
   - **Thermal / hypothermia (later):** no open CHB-MIT-equivalent — likely a
     build-your-own-dataset problem. Deferred.
 - **M (Massive hemorrhage) — PAUSED pending better physiology data.** VitalDB is
