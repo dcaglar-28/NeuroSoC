@@ -308,13 +308,61 @@ use `--real` for meaningful accuracy.
 - macOS Apple Silicon (M-series). Native arm64 Python. `.venv` in repo root.
 - `pip install -e .`; run `python -m eia.train`.
 
-## Next planned step
-VitalDB (above) adds a real, if coarse (intraoperative/anesthetized, whole-case
-estimate), hemorrhage-relevant PPG label — but it is not the conscious-patient
-central-hypovolemia signal LBNP would give. Still find/add a real
-induced-hypovolemia or LBNP PPG dataset for that (untouched so far — do not
-conflate the two), then build a fusion head combining ECG + PPG over a MARCH
-timeline. Then heart/lung sounds, EEG, and the ultrasound-probe path.
+## MARCH roadmap (sequenced by validated-model reachability, not MARCH order)
+Deliberate sequencing decision: maximize the number of genuinely-*learning*
+models on open clinical data before tackling the hardest sensing/labeling
+problems. The lesson from hemorrhage is that the bottleneck is usually the
+LABELS, not the model — so prioritize signals with strong physiology + excellent
+open labels.
+- **C (Circulation) — DONE.** ECG arrhythmia on real MIT-BIH is the one modality
+  genuinely learning on real data (float balanced acc 0.845). On-chip XyloSim
+  fidelity (~0.56) is the open engineering gap, not a data gap.
+- **H (Head) — Phase 1 EEG pipeline built and Xylo-verified; cross-patient
+  result is ~chance at the data scale run so far (data-volume-limited, not a
+  data-quality dead end like VitalDB — see docs/eeg_seizure_results.md).**
+  Split into two independent workstreams:
+  - **EEG:** seizure detection on **CHB-MIT** (open, WFDB-via-`read_edf`,
+    expert seizure labels, decades of benchmarks). Task spec:
+    `docs/eeg_seizure_task.md`. Built hardware-first (23ch native → fixed
+    6-channel bipolar montage → 0.5-25 Hz band-pass → resample to 128
+    timesteps → delta encoder → 12 spike channels → LIF SNN, `n_in=12` →
+    XyloSim; `input 12/16` in the footprint check, margin under the 16-channel
+    ceiling). Subject-independent split (patient-grouped, chb21 folded into
+    chb01) is wired and leakage-checked. **Measured (9 patients, 1 seizure
+    record each — 718 windows, 5 seeds): float balanced acc 0.525 +/- 0.030,
+    XyloSim 0.500 +/- 0.028, both flat at chance; AUROC ~0.52-0.55; false
+    alarms 300-325/hour (unusable as-is).** Root cause is believed to be data
+    volume (9 patients/1 record each is far below CHB-MIT's ~22-24 patients),
+    not signal absence — CHB-MIT seizure detection is well-established as
+    learnable in the literature, unlike VitalDB. The run was deliberately
+    kept this small because PhysioNet download throughput for CHB-MIT's ~40MB
+    EDF files varied wildly (4-25+ min/record) during this session; two
+    larger attempts (13 then 9 subjects x up to 3 records) were killed
+    mid-run as impractically slow. `data/chbmit/` caches every record
+    downloaded so far — rerunning with more subjects/records via
+    `--eeg-subjects`/`--eeg-seizure-records`/`--eeg-nonseizure-records` is the
+    natural next step, not a re-download. Also found: `chb12/13/14/16/17/18/
+    19/21` all fail to load via `wfdb.io.convert.edf.read_edf` ("math domain
+    error") — a real, reproducible parser limitation, not guessed; excluded
+    from `datasets.DEFAULT_EEG_SUBJECTS`. Metrics reported are
+    AUROC/AUPRC/sensitivity/specificity/FA-per-hour, NOT accuracy (extreme
+    imbalance), per the task spec. Caveat: CHB-MIT is pediatric epilepsy, not
+    field TBI. Phase 2 = TUSZ (registration-gated) + Siena generalization; Phase 3
+    = TBI spectral screening (slowing, burst suppression) — a different task.
+  - **Thermal / hypothermia (later):** no open CHB-MIT-equivalent — likely a
+    build-your-own-dataset problem. Deferred.
+- **M (Massive hemorrhage) — PAUSED pending better physiology data.** VitalDB is
+  settled ~chance (window + case level); revisit only with LBNP/CRM induced-
+  hypovolemia data (request the gated Oslo/Yale sets, or build the synthetic
+  time-resolved generator). The CRM feature recipe (`An Explainable ML Model for
+  CRM`, MDPI Bioeng. 2023) is the method to use once real-physiology data exists.
+- **R (Respiration) — PAUSED.** BIDMC already carries a respiration channel
+  (currently only its PPG is used); pick up after H.
+- **A (Airway) — future work.** Needs breath/lung-sound audio, vision,
+  capnography — no data or model yet.
+
+After H/EEG lands, the fusion head (ECG + the next validated modality over a
+MARCH timeline) and the ultrasound-probe path remain the longer-horizon steps.
 
 ## Working style
 Be concise and direct. Keep code in the `eia` package; keep notebooks thin so the

@@ -17,7 +17,7 @@ Additional modalities (heart & lung sounds, EEG) plug into the same pattern.
 src/eia/
   encoding.py         # delta / level-crossing event encoders (NumPy, no torch)
   energy.py           # analytical MAC-vs-SOP energy model (NumPy, no torch)
-  datasets.py         # ECG (MIT-BIH) + PPG (BIDMC, VitalDB) loaders, real (wfdb/vitaldb) or synthetic
+  datasets.py         # ECG (MIT-BIH) + PPG (BIDMC, VitalDB) + EEG (CHB-MIT) loaders, real or synthetic
   report.py           # data_card(): per-dataset summary + red-flag warnings (NumPy)
   viz.py              # plots: waveforms per class, delta encoding scheme, class balance
   models.py           # spiking classifier (snnTorch) + conventional baseline
@@ -55,6 +55,7 @@ python -m eia.train --modality ppg --real      # real BIDMC PPG & Respiration da
 python -m eia.train --modality ppg --real --ppg-source vitaldb  # real VitalDB blood-loss label
 python -m eia.train --sweep                    # trace the accuracy vs. energy trade-off
 python -m eia.train --modality ppg --sweep --real
+python -m eia.train --modality eeg --real      # real CHB-MIT seizure detection
 python -m eia.train --real --require-real      # fail loudly instead of silently using synthetic
                                                 # if the real dataset can't be loaded
 ```
@@ -102,6 +103,8 @@ python scripts/xylo_verify.py --no-combined            # skip the Part C one-chi
 python scripts/xylo_verify.py --modality ecg --window 90  # override the encoded window/timestep count
 python scripts/xylo_verify.py --modality ppg --real --ppg-source vitaldb \
     --n-seeds 5                                # real VitalDB blood-loss label, multi-seed report
+python scripts/xylo_verify.py --modality eeg --real --require-real \
+    --n-seeds 5                                # real CHB-MIT seizure detection, subject-independent
 ```
 
 For each modality: a data card, then float-model accuracy, XyloSim accuracy,

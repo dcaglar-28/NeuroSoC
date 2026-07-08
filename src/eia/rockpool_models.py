@@ -67,12 +67,16 @@ def _xylo_support():
     return x
 
 
-def build_xylo_snn(n_hidden: int = 63, n_out: int = 2, dt: float = 1e-3):
+def build_xylo_snn(n_hidden: int = 63, n_out: int = 2, dt: float = 1e-3,
+                    n_in: int = N_INPUT_CHANNELS):
     """Build the LIF classifier in Rockpool (Torch backend), Xylo-mappable.
 
-    Input is the 2-channel delta raster (fed as `window` timesteps x 2 channels),
-    so `n_in = 2`. One hidden LIF layer within Xylo's neuron budget, then a
-    readout LIF layer over `n_out` output neurons.
+    Input is the delta ON/OFF raster (fed as `window` timesteps x `n_in`
+    channels). `n_in` defaults to 2 — one channel's ON/OFF pair (ECG/PPG).
+    Multi-channel modalities (EEG: N montage channels -> 2N spike channels
+    after per-channel delta encoding) pass `n_in=2*N` explicitly; must stay
+    <= `XYLO_MAX_INPUT_CHANNELS`. One hidden LIF layer within Xylo's neuron
+    budget, then a readout LIF layer over `n_out` output neurons.
 
     Returns an untrained Rockpool `Sequential`. Train it with the Torch backend
     like any nn.Module (surrogate gradients are built into LIFBitshiftTorch).
@@ -81,6 +85,9 @@ def build_xylo_snn(n_hidden: int = 63, n_out: int = 2, dt: float = 1e-3):
     from rockpool.nn.combinators import Sequential
     from rockpool.parameters import Constant
 
+    if n_in > XYLO_MAX_INPUT_CHANNELS:
+        raise ValueError(
+            f"n_in={n_in} exceeds Xylo budget ({XYLO_MAX_INPUT_CHANNELS})")
     if n_hidden > XYLO_MAX_HIDDEN_NEURONS:
         raise ValueError(
             f"n_hidden={n_hidden} exceeds Xylo budget ({XYLO_MAX_HIDDEN_NEURONS})")
@@ -161,7 +168,7 @@ def build_xylo_snn(n_hidden: int = 63, n_out: int = 2, dt: float = 1e-3):
     #   PeriodicExponential   : float acc 0.772, XyloSim agreement 0.680
     # Kept the default surrogate on the evidence, not the tutorial's prior.
     net = Sequential(
-        LinearTorch((N_INPUT_CHANNELS, n_hidden), has_bias=False),
+        LinearTorch((n_in, n_hidden), has_bias=False),
         LIFBitshiftTorch(n_hidden, tau_mem=Constant(0.02), tau_syn=Constant(0.02),
                           threshold=Constant(1.0), bias=0.5, dt=dt),
         LinearTorch((n_hidden, n_out), has_bias=False),
@@ -305,8 +312,12 @@ def verify_against_sim(net, spec, input_raster):
         spec: output of `map_and_quantize(net)`.
         input_raster: (window, 2) array of {0,1} events from `to_input_raster`.
 
-    Returns dict with both predictions (argmax of summed output spikes) and
-    whether they agree.
+    Returns dict with both predictions (argmax of summed output spikes),
+    whether they agree, and the raw summed-output-spike vectors
+    (`out_float`/`out_xylo`, shape (n_out,)) — callers that need a
+    continuous score (e.g. AUROC/AUPRC under class imbalance, which argmax
+    predictions alone can't support) derive it from these rather than
+    re-running the sim.
     """
     import numpy as np
     import torch
@@ -321,10 +332,14 @@ def verify_against_sim(net, spec, input_raster):
     out_float = out_float.detach().numpy()
     sim_out, _, _ = sim(raster)                           # (time, chans)
 
-    pred_float = int(out_float.reshape(-1, out_float.shape[-1]).sum(axis=0).argmax())
-    pred_xylo = int(np.asarray(sim_out).sum(axis=0).argmax())
+    out_float_sum = out_float.reshape(-1, out_float.shape[-1]).sum(axis=0)
+    out_xylo_sum = np.asarray(sim_out).sum(axis=0)
+    pred_float = int(out_float_sum.argmax())
+    pred_xylo = int(out_xylo_sum.argmax())
     return {
         "pred_float": pred_float,
         "pred_xylo": pred_xylo,
+        "out_float": out_float_sum,
+        "out_xylo": out_xylo_sum,
         "match": pred_float == pred_xylo,
     }

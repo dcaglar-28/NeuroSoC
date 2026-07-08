@@ -55,6 +55,27 @@ _CARDS = {
         "Real induced central hypovolemia — the intended hemorrhage signal. "
         "Usually few subjects: split by subject, watch N.",
     ),
+    ("eeg", "synthetic"): (
+        "0 = band-limited noise per channel, 1 = added higher-amplitude "
+        "near-shared-phase rhythmic oscillation across channels (a stylised "
+        "hypersynchrony proxy).",
+        "Separable by construction — proves the multi-channel pipeline "
+        "pattern, NOT a real seizure-detection claim.",
+    ),
+    ("eeg", "chbmit"): (
+        "0 = non-seizure window, 1 = window overlaps an expert-annotated "
+        "seizure interval (CHB-MIT summary files).",
+        "REAL scalp EEG with expert seizure labels — but PEDIATRIC EPILEPSY "
+        "MONITORING, not field TBI (a legitimate 'Head' component — "
+        "post-traumatic seizure / altered mental status — not trauma ground "
+        "truth). Extreme class imbalance (seizures are a tiny fraction of "
+        "continuous recording time) — report AUROC/AUPRC/sensitivity/"
+        "specificity/false-alarms-per-hour, not accuracy. Fixed 6-channel "
+        "bipolar montage (`datasets.EEG_MONTAGE`), not patient-specific. "
+        "Headline metric MUST be subject-independent (split by patient, "
+        "`groups`; chb21 is the same patient as chb01) — a within-patient "
+        "number is not the deployment story.",
+    ),
 }
 
 
@@ -102,6 +123,8 @@ def _modality_of(data) -> str:
         return "ecg"
     if name.startswith("ppg"):
         return "ppg"
+    if name.startswith("eeg"):
+        return "eeg"
     return getattr(data, "modality", "unknown")
 
 
@@ -111,7 +134,10 @@ def data_card(data, model_acc: float | None = None, verbose: bool = True,
     """Build (and optionally print) a data card for one dataset.
 
     Args:
-        data: an EcgData / PpgData (has .X, .y, .fs, .source).
+        data: an EcgData / PpgData / EegData (has .X, .y, .fs, .source). `X`
+            is (n_samples, window) for ECG/PPG or (n_samples, channels,
+            window) for EEG — `window` here always means the LAST axis
+            (time), so it and `duration_s` are correct either way.
         model_acc: optional test accuracy of a trained model on this dataset;
             if within `not_learning_margin` of the base rate, raises a warning.
         verbose: print the card.
@@ -121,7 +147,7 @@ def data_card(data, model_acc: float | None = None, verbose: bool = True,
     modality = _modality_of(data)
     source = getattr(data, "source", "unknown")
     n = int(y.size)
-    window = int(X.shape[1]) if X.ndim >= 2 else 0
+    window = int(X.shape[-1]) if X.ndim >= 2 else 0
     fs = float(getattr(data, "fs", 0.0) or 0.0)
     duration_s = (window / fs) if fs else 0.0
 

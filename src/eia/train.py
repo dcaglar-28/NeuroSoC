@@ -19,11 +19,11 @@ import time
 import numpy as np
 
 from . import encoding, energy, report
-from .datasets import load_ecg, load_ppg, load_ppg_vitaldb
+from .datasets import load_ecg, load_eeg, load_ppg, load_ppg_vitaldb
 from .device import get_device
 from .models import build_baseline, build_snn
 
-_LOADERS = {"ecg": load_ecg, "ppg": load_ppg}
+_LOADERS = {"ecg": load_ecg, "ppg": load_ppg, "eeg": load_eeg}
 _PPG_SOURCE_LOADERS = {"bidmc": load_ppg, "vitaldb": load_ppg_vitaldb}
 
 
@@ -61,13 +61,21 @@ def run(real: bool = False, epochs: int = 10, hidden: int = 128,
           f"provenance={card.provenance}  X={data.X.shape}  "
           f"pos_frac={data.y.mean():.2f}  fs={data.fs}Hz")
 
-    # Case-grouped split when `data.groups` is set (VitalDB: many highly
-    # correlated windows share one case-level label) — plain stratified
-    # split otherwise, unchanged from before.
+    # models.py's snnTorch research path is single-channel (flattens (2,
+    # window) -> 2*window); EEG's multi-channel front end is handled
+    # properly in rockpool_models.py / scripts/xylo_verify.py instead (the
+    # hardware-accurate path). Here, flatten (n, channels, window) into
+    # (n, channels*window) so this fast-research pipeline runs unchanged —
+    # a documented simplification for this path only, not a deployment claim.
+    X_all = data.X.reshape(data.X.shape[0], -1) if data.X.ndim == 3 else data.X
+
+    # Case-grouped split when `data.groups` is set (VitalDB/EEG: many highly
+    # correlated windows share one case/patient-level label) — plain
+    # stratified split otherwise, unchanged from before.
     if getattr(data, "groups", None) is not None:
         gss = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=seed)
-        tr_idx, te_idx = next(gss.split(data.X, data.y, groups=data.groups))
-        Xtr, Xte, ytr, yte = data.X[tr_idx], data.X[te_idx], data.y[tr_idx], data.y[te_idx]
+        tr_idx, te_idx = next(gss.split(X_all, data.y, groups=data.groups))
+        Xtr, Xte, ytr, yte = X_all[tr_idx], X_all[te_idx], data.y[tr_idx], data.y[te_idx]
         tr_cases = set(data.groups[tr_idx].tolist())
         te_cases = set(data.groups[te_idx].tolist())
         overlap = tr_cases & te_cases
@@ -77,7 +85,7 @@ def run(real: bool = False, epochs: int = 10, hidden: int = 128,
             raise RuntimeError(f"case-level leakage across splits: {overlap}")
     else:
         Xtr, Xte, ytr, yte = train_test_split(
-            data.X, data.y, test_size=0.25, random_state=seed, stratify=data.y)
+            X_all, data.y, test_size=0.25, random_state=seed, stratify=data.y)
 
     # Tensors for the dense baseline (raw windows).
     Xtr_t = torch.tensor(Xtr, device=device)
@@ -92,7 +100,7 @@ def run(real: bool = False, epochs: int = 10, hidden: int = 128,
           f"{float((Xtr_s != 0).float().mean()):.3f}")
 
     n_classes = int(data.y.max()) + 1
-    window = data.X.shape[1]
+    window = X_all.shape[1]
 
     def batches(n):
         idx = torch.randperm(n)
@@ -190,10 +198,11 @@ def sweep(real: bool = False, epochs: int = 10, device_pref: str = "auto",
 
 def main():
     ap = argparse.ArgumentParser(description="EIA Phase-0 SNN demo")
-    ap.add_argument("--modality", default="ecg", choices=["ecg", "ppg"],
+    ap.add_argument("--modality", default="ecg", choices=["ecg", "ppg", "eeg"],
                     help="which physiological signal to classify")
     ap.add_argument("--real", action="store_true",
-                    help="try real data (MIT-BIH for ecg, BIDMC for ppg)")
+                    help="try real data (MIT-BIH for ecg, BIDMC for ppg, "
+                         "CHB-MIT for eeg)")
     ap.add_argument("--require-real", action="store_true",
                     help="raise instead of silently falling back to synthetic "
                          "if real data fails to load (implies --real)")

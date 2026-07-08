@@ -1,4 +1,4 @@
-"""ECG and PPG dataset loading.
+"""ECG, PPG, and EEG dataset loading.
 
 Each modality has two paths:
   * a real loader streamed from PhysioNet via the `wfdb` package (needs
@@ -43,6 +43,26 @@ class PpgData:
     # case). None for datasets with no such grouping (bidmc, synthetic) —
     # callers must split by group instead of by window when this is set, to
     # avoid case-level leakage between train/val/test.
+    groups: np.ndarray | None = None
+
+
+@dataclass
+class EegData:
+    X: np.ndarray  # (n_samples, n_channels, window) float32 — multi-channel,
+                    # unlike EcgData/PpgData's (n_samples, window): Xylo's
+                    # input framing needs one axis per montage channel, each
+                    # delta-encoded into its own ON/OFF pair (see
+                    # scripts/xylo_verify.py's `_encode_batch`).
+    y: np.ndarray   # (n_samples,) int64 — 0 = non-seizure, 1 = seizure
+    fs: float       # effective sampling rate (Hz) of the LAST axis (window),
+                    # i.e. after any resample_to — matches `report.data_card`'s
+                    # `duration_s = window / fs` for both 2-D and 3-D X.
+    source: str     # "chbmit" or "synthetic"
+    requested_real: bool = False
+    # Canonical patient id per window (chb21 folded into chb01 — see
+    # `eeg_canonical_patient`). Required: CHB-MIT's headline metric is
+    # subject-independent, so every consumer must split by patient, never by
+    # window (the VitalDB case-leakage lesson, same mechanism as PpgData.groups).
     groups: np.ndarray | None = None
 
 
@@ -533,5 +553,327 @@ def load_ppg_vitaldb(prefer_real: bool = True, require_real: bool = False,
                 ) from e
             print(f"[warn] real VitalDB PPG unavailable ({e}); falling back to synthetic PPG.")
     data = make_synthetic_ppg()
+    data.requested_real = prefer_real
+    return data
+
+
+# --------------------------------------------------------------------------- #
+# EEG — real CHB-MIT seizure detection (MARCH "H", Phase 1)
+# --------------------------------------------------------------------------- #
+# Fixed bipolar montage (10-20 "double banana"), applied identically to every
+# subject — NOT patient-specific channel selection, since a field device has
+# never seen this patient (docs/eeg_seizure_task.md Flag 2). 6 channels ->
+# 12 spike channels after ON/OFF delta encoding, leaving margin under Xylo's
+# 16-input-channel ceiling (8ch would sit exactly at the limit with zero
+# headroom). Left/right frontotemporal pairs (common seizure-focus region)
+# plus the midline central-parietal pair, verified present in every
+# successfully-read CHB-MIT header checked (chb01, chb02, chb03, chb05,
+# chb08, chb24 — see docs/eeg_seizure_task.md Part 0).
+EEG_MONTAGE = ["FP1-F7", "F7-T7", "FP2-F8", "F8-T8", "FZ-CZ", "CZ-PZ"]
+
+EEG_NATIVE_FS = 256.0  # CHB-MIT's fixed sampling rate, confirmed via wfdb
+
+# chb21 is the SAME PATIENT as chb01 (a second recording session) — CHB-MIT's
+# own documentation states this. Canonicalizing prevents one patient's
+# windows from landing in both train and test under two different ids.
+_EEG_PATIENT_ALIASES = {"chb21": "chb01"}
+
+# Subjects with confirmed-readable headers (verified via a header_only probe
+# against every subject's first record before writing this default list).
+# chb12, chb13, chb14, chb16, chb17, chb18, chb19, chb21 all raise a "math
+# domain error" from wfdb's EDF parser on their very first record — a real,
+# reproducible limitation of `wfdb.io.convert.edf.read_edf` on those specific
+# files, not guessed and not per-record flakiness. `load_chbmit` also skips
+# any subject/record it can't read at load time and prints why, so passing
+# an unreadable subject here is harmless (0 windows from it).
+# chb20, chb22, chb23, chb24 are ALSO confirmed-readable but excluded from
+# this default purely for download time (each subject costs ~2-3 records x
+# ~40MB streamed through wfdb's EDF reader, observed at several minutes per
+# record) — pass them explicitly via `subjects=` if you want a larger pool.
+DEFAULT_EEG_SUBJECTS = ["chb01", "chb02", "chb03", "chb05", "chb06", "chb07",
+                         "chb08", "chb09", "chb10"]
+
+
+def eeg_canonical_patient(subject: str) -> str:
+    """Map a CHB-MIT subject id to its canonical patient id (chb21 -> chb01,
+    the one documented same-patient alias in this dataset). Pure function so
+    the group-merging logic is unit-testable without any network access."""
+    return _EEG_PATIENT_ALIASES.get(subject, subject)
+
+
+def select_montage(sig: np.ndarray, sig_name: list, montage: list) -> np.ndarray:
+    """Select and reorder fixed montage channels from a (n_samples, n_sig)
+    array using the record's own channel-name list. Raises (does not
+    silently substitute a different channel) if any montage channel is
+    missing — the caller should catch this and skip the record, mirroring
+    VitalDB's "skip cases missing a required track" pattern.
+    """
+    missing = [ch for ch in montage if ch not in sig_name]
+    if missing:
+        raise ValueError(f"missing montage channel(s): {missing}")
+    idx = [sig_name.index(ch) for ch in montage]
+    return sig[:, idx]
+
+
+def bandpass_eeg(sig: np.ndarray, fs: float, band: tuple = (0.5, 25.0)) -> np.ndarray:
+    """4th-order Butterworth band-pass, zero-phase (`filtfilt`), along axis 0
+    (time), applied to every channel. Restricts to the seizure-relevant band
+    BEFORE resampling to a short Xylo timestep budget — the point being that
+    256 Hz full-bandwidth resolution isn't needed once the signal is band-
+    limited to ~25 Hz, so a much shorter timestep count still holds the
+    seizure signature (docs/eeg_seizure_task.md's timestep-count lesson,
+    same mechanism as `docs/ecg_quant_diagnosis.md`'s root cause: on-chip
+    fidelity degrades with timestep count, not weight bits).
+    """
+    from scipy.signal import butter, filtfilt
+    b, a = butter(4, band, btype="band", fs=fs)
+    return filtfilt(b, a, sig, axis=0)
+
+
+def resample_windows(X: np.ndarray, resample_to: int) -> np.ndarray:
+    """FFT-resample the last axis (time) of a 2-D (n, window) or 3-D
+    (n, channels, window) array to `resample_to` samples — the
+    `load_mitbih`-style decoupling of "how much signal is captured" from
+    "how many Xylo timesteps it costs." Generic over ndim so it serves both
+    the single-channel ECG/PPG path and EEG's multi-channel one.
+    """
+    from scipy.signal import resample as _fft_resample
+    return _fft_resample(X, resample_to, axis=-1)
+
+
+def parse_chbmit_summary(text: str) -> dict:
+    """Parse a CHB-MIT `chbXX-summary.txt` into {record_name: [(start, end), ...]}
+    (seizure intervals in seconds since the record started; empty list = no
+    seizures in that record). Handles both the singular format used when a
+    record has exactly one seizure (`Seizure Start Time:`) and the numbered
+    format used for 2+ (`Seizure 2 Start Time:`) — confirmed against live
+    files for both cases before writing this (docs/eeg_seizure_task.md Part 0).
+    Pure function, no network — unit-testable on a small literal string.
+    """
+    import re
+    records: dict = {}
+    for block in text.split("File Name: ")[1:]:
+        lines = block.splitlines()
+        fname = lines[0].strip()
+        rec = fname[:-4] if fname.endswith(".edf") else fname
+        starts = [int(m) for m in re.findall(
+            r"Seizure(?:\s+\d+)?\s+Start Time:\s*(\d+)\s*seconds", block)]
+        ends = [int(m) for m in re.findall(
+            r"Seizure(?:\s+\d+)?\s+End Time:\s*(\d+)\s*seconds", block)]
+        records[rec] = list(zip(starts, ends))
+    return records
+
+
+def _label_seizure_window(t0: float, t1: float, seizures: list) -> int:
+    """1 if window [t0, t1) (seconds) overlaps any seizure interval."""
+    return int(any(t0 < e and t1 > s for s, e in seizures))
+
+
+def _fetch_chbmit_summary(subject: str, cache_dir: str) -> dict:
+    import os
+    import urllib.request
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, f"{subject}-summary.txt")
+    if not os.path.exists(path):
+        url = f"https://physionet.org/files/chbmit/1.0.0/{subject}/{subject}-summary.txt"
+        urllib.request.urlretrieve(url, path)
+    with open(path, "r", errors="ignore") as f:
+        text = f.read()
+    return parse_chbmit_summary(text)
+
+
+def _load_chbmit_record_montage(subject: str, record: str, montage: list,
+                                 cache_dir: str):
+    """Stream one CHB-MIT record's EDF via wfdb, select the fixed montage,
+    and cache the (much smaller) montage-only array to disk — repeat runs
+    (e.g. a --resample-to sweep) don't need to re-download the full
+    23-channel, ~42 MB-per-hour EDF every time.
+    """
+    import os
+    path = os.path.join(cache_dir, f"{subject}_{record}_montage.npz")
+    if os.path.exists(path):
+        d = np.load(path)
+        return d["sig"], float(d["fs"])
+    from wfdb.io.convert.edf import read_edf
+    os.makedirs(cache_dir, exist_ok=True)
+    h = read_edf(record + ".edf", pn_dir=f"chbmit/{subject}")
+    sig = select_montage(h.p_signal.astype(np.float32), h.sig_name, montage)
+    fs = float(h.fs)
+    np.savez(path, sig=sig, fs=fs)
+    return sig, fs
+
+
+def load_chbmit(
+    subjects: list | None = None,
+    seizure_records_per_subject: int = 2,
+    nonseizure_records_per_subject: int = 1,
+    window_sec: float = 4.0,
+    resample_to: int | None = 128,
+    montage: list | None = None,
+    band_pass: tuple = (0.5, 25.0),
+    neg_per_record: int = 60,
+    cache_dir: str = "data/chbmit",
+    seed: int = 0,
+) -> EegData:
+    """Stream CHB-MIT scalp EEG, windowed and labelled for seizure detection.
+
+    Hardware-first pipeline (docs/eeg_seizure_task.md): 23 native channels ->
+    fixed 6-channel bipolar montage (`EEG_MONTAGE`) -> band-pass to the
+    seizure band -> per-window z-score -> FFT-resample to `resample_to`
+    Xylo timesteps. Requires `wfdb` (`pip install 'eia[data]'`) and network.
+
+    Args:
+        subjects: CHB-MIT subject ids to pull from (default
+            `DEFAULT_EEG_SUBJECTS`). chb21 is automatically folded into
+            chb01's patient group if included (`eeg_canonical_patient`).
+        seizure_records_per_subject: up to this many of the subject's
+            seizure-containing records are used (ALL seizure windows from a
+            chosen record are kept; see `neg_per_record` for negatives).
+        nonseizure_records_per_subject: up to this many records with zero
+            seizures, for non-ictal background diversity.
+        window_sec: physiological capture duration per window, at native
+            256 Hz (a duration, not a Xylo timestep budget — see
+            `resample_to`, same decoupling as `datasets.load_mitbih`).
+        resample_to: FFT-resample each window from `window_sec * 256` native
+            samples down to this many Xylo timesteps; None keeps native.
+        montage: override the fixed channel list (default `EEG_MONTAGE`).
+        band_pass: seizure-band Butterworth cutoffs in Hz.
+        neg_per_record: cap on non-seizure windows kept per record (a 1-hour
+            record has ~900 windows at window_sec=4; keeping all of them
+            would swamp the rare seizure windows and balloon dataset size).
+            ALL seizure windows in a chosen record are always kept.
+        cache_dir: per-record montage cache (gitignored `data/`).
+        seed: controls which negative windows are subsampled per record.
+
+    Returns:
+        EegData with `source="chbmit"`, `groups` = canonical patient id per
+        window (subject-independent split key).
+    """
+    try:
+        import wfdb  # noqa: F401  (import check; actual reads use wfdb.io.convert.edf)
+    except ImportError as e:  # pragma: no cover
+        raise ImportError("Install the data extra: pip install 'eia[data]'") from e
+
+    subjects = subjects or DEFAULT_EEG_SUBJECTS
+    montage = montage or EEG_MONTAGE
+    rng = np.random.default_rng(seed)
+    window_native = int(round(window_sec * EEG_NATIVE_FS))
+
+    X_list, y_list, group_list = [], [], []
+    for subject in subjects:
+        try:
+            summary = _fetch_chbmit_summary(subject, cache_dir)
+        except Exception as e:
+            print(f"[warn] chbmit {subject}: failed to fetch summary ({e}); skipping subject.")
+            continue
+
+        seizure_recs = sorted(r for r, sz in summary.items() if sz)[:seizure_records_per_subject]
+        nonseizure_recs = sorted(
+            r for r, sz in summary.items() if not sz)[:nonseizure_records_per_subject]
+
+        for record in seizure_recs + nonseizure_recs:
+            try:
+                sig, fs = _load_chbmit_record_montage(subject, record, montage, cache_dir)
+            except Exception as e:
+                print(f"[warn] chbmit {subject}/{record}: failed to load ({e}); skipping record.")
+                continue
+
+            filtered = bandpass_eeg(sig, fs, band_pass)
+            n_windows = filtered.shape[0] // window_native
+            seizures = summary.get(record, [])
+
+            pos_w, neg_w = [], []
+            for w in range(n_windows):
+                t0, t1 = w * window_native / fs, (w + 1) * window_native / fs
+                (pos_w if _label_seizure_window(t0, t1, seizures) else neg_w).append(w)
+            if len(neg_w) > neg_per_record:
+                neg_w = list(rng.choice(neg_w, size=neg_per_record, replace=False))
+
+            patient = eeg_canonical_patient(subject)
+            for w in pos_w + neg_w:
+                seg = filtered[w * window_native:(w + 1) * window_native, :].T  # (n_ch, window)
+                X_list.append(seg.astype(np.float32))
+                y_list.append(1 if w in pos_w else 0)
+                group_list.append(patient)
+
+    if not X_list:
+        raise RuntimeError("No EEG windows extracted from CHB-MIT.")
+
+    X = np.stack(X_list)  # (n, n_ch, window_native)
+    fs_eff = EEG_NATIVE_FS
+    if resample_to is not None and resample_to != window_native:
+        X = resample_windows(X, resample_to)
+        fs_eff = EEG_NATIVE_FS * (resample_to / window_native)
+    X = (X - X.mean(axis=-1, keepdims=True)) / (X.std(axis=-1, keepdims=True) + 1e-8)
+
+    return EegData(X=X.astype(np.float32), y=np.array(y_list, dtype=np.int64),
+                    fs=fs_eff, source="chbmit",
+                    groups=np.array(group_list, dtype="<U8"))
+
+
+def make_synthetic_eeg(
+    n_samples: int = 800,
+    n_channels: int = len(EEG_MONTAGE),
+    window: int = 128,
+    fs: float = 128.0,
+    abnormal_frac: float = 0.15,
+    noise: float = 0.3,
+    seed: int = 0,
+) -> EegData:
+    """Generate a synthetic seizure/non-seizure EEG-like set: non-seizure
+    windows are band-limited noise per channel; seizure windows add a
+    higher-amplitude rhythmic (spike-wave-like) oscillation shared with
+    correlated timing across channels, roughly mimicking hypersynchronous
+    ictal activity vs. background — a stylised proxy, not a clinical claim
+    (same spirit as the other `make_synthetic_*` generators).
+    """
+    rng = np.random.default_rng(seed)
+    t = np.linspace(0, window / fs, window)
+    X = np.empty((n_samples, n_channels, window), dtype=np.float32)
+    y = np.empty((n_samples,), dtype=np.int64)
+    for i in range(n_samples):
+        seizure = rng.random() < abnormal_frac
+        y[i] = 1 if seizure else 0
+        freq = rng.uniform(2.5, 4.0)  # spike-wave-like frequency if seizure
+        for c in range(n_channels):
+            sig = rng.normal(0, noise, size=window)
+            if seizure:
+                phase = rng.normal(0, 0.1)  # near-shared phase across channels
+                sig = sig + 1.5 * np.sin(2 * np.pi * freq * t + phase)
+            X[i, c] = sig.astype(np.float32)
+    return EegData(X=X, y=y, fs=fs, source="synthetic")
+
+
+def load_eeg(prefer_real: bool = True, require_real: bool = False,
+             **kwargs) -> EegData:
+    """Load EEG data, preferring real CHB-MIT but falling back to synthetic.
+
+    Args:
+        prefer_real: try `load_chbmit()` first.
+        require_real: if real data was requested and fails to load, raise
+            instead of silently substituting synthetic. Every allowed
+            fallback still prints a `[warn]` line naming the reason.
+        **kwargs: forwarded to `load_chbmit` (subjects,
+            seizure_records_per_subject, nonseizure_records_per_subject,
+            window_sec, resample_to, montage, band_pass, neg_per_record,
+            cache_dir, seed) when real; ignored when falling back to
+            synthetic.
+    """
+    if require_real and not prefer_real:
+        raise ValueError("require_real=True has no effect with prefer_real=False "
+                          "(nothing was asked to be real).")
+    if prefer_real:
+        try:
+            data = load_chbmit(**kwargs)
+            data.requested_real = True
+            return data
+        except Exception as e:  # noqa: BLE001  — any failure -> synthetic (or raise)
+            if require_real:
+                raise RuntimeError(
+                    f"--require-real: real CHB-MIT EEG failed to load ({e}); "
+                    "refusing to silently substitute synthetic EEG."
+                ) from e
+            print(f"[warn] real CHB-MIT EEG unavailable ({e}); falling back to synthetic EEG.")
+    data = make_synthetic_eeg()
     data.requested_real = prefer_real
     return data

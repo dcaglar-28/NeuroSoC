@@ -36,21 +36,39 @@ import torch
 import torch.nn as nn
 
 from eia import case_level, encoding, report, rockpool_models as rm, xylo_budget as xb
-from eia.datasets import load_ecg, load_ppg, load_ppg_vitaldb
+from eia.datasets import load_ecg, load_eeg, load_ppg, load_ppg_vitaldb
 
-_LOADERS = {"ecg": load_ecg, "ppg": load_ppg}
+_LOADERS = {"ecg": load_ecg, "ppg": load_ppg, "eeg": load_eeg}
 _PPG_SOURCE_LOADERS = {"bidmc": load_ppg, "vitaldb": load_ppg_vitaldb}
 _HIDDEN_KEY = "1_LIFBitshiftTorch"
 _OUT_KEY = "3_LIFBitshiftTorch"
 
 
 def _encode_batch(X: np.ndarray, threshold: float) -> np.ndarray:
-    """Delta-encode each window into a Xylo input raster. -> (n, window, 2)."""
-    out = np.empty((X.shape[0], X.shape[1], 2), dtype=np.float32)
-    for i in range(X.shape[0]):
-        enc = encoding.delta_encode_2ch(encoding.normalize(X[i]), threshold)
-        out[i] = rm.to_input_raster(enc)
-    return out
+    """Delta-encode each window into a Xylo input raster.
+
+    2-D X (n, window) — single-channel ECG/PPG -> (n, window, 2) (one ON/OFF
+    pair). 3-D X (n, channels, window) — multi-channel EEG -> each channel
+    gets its own delta-encoded ON/OFF pair, concatenated along the channel
+    axis -> (n, window, 2*channels). Must stay <= 16 (Xylo's input-channel
+    ceiling) — the caller picks `channels` accordingly (see `EEG_MONTAGE`).
+    """
+    if X.ndim == 2:
+        out = np.empty((X.shape[0], X.shape[1], 2), dtype=np.float32)
+        for i in range(X.shape[0]):
+            enc = encoding.delta_encode_2ch(encoding.normalize(X[i]), threshold)
+            out[i] = rm.to_input_raster(enc)
+        return out
+    if X.ndim == 3:
+        n, n_ch, window = X.shape
+        out = np.empty((n, window, 2 * n_ch), dtype=np.float32)
+        for i in range(n):
+            chans = [rm.to_input_raster(
+                encoding.delta_encode_2ch(encoding.normalize(X[i, c]), threshold))
+                for c in range(n_ch)]
+            out[i] = np.concatenate(chans, axis=1)  # (window, 2) x n_ch -> (window, 2*n_ch)
+        return out
+    raise ValueError(f"unsupported X.ndim={X.ndim} (expected 2 or 3)")
 
 
 def per_class_recall(preds, y_t, n_classes: int) -> list:
@@ -108,11 +126,12 @@ def _eval(net, R, y_t, n_classes: int):
     net.reset_state()
     with torch.no_grad():
         out, _state, rec = net(R, record=True)
-    preds = out.sum(dim=1).argmax(dim=1)
+    logits = out.sum(dim=1)  # (n, n_classes) summed output spikes
+    preds = logits.argmax(dim=1)
     acc = (preds == y_t).float().mean().item()
     bal_acc = balanced_accuracy(preds, y_t, n_classes)
     recalls = per_class_recall(preds, y_t, n_classes)
-    return acc, bal_acc, recalls, rec[_HIDDEN_KEY]["spikes"].mean().item(), preds
+    return acc, bal_acc, recalls, rec[_HIDDEN_KEY]["spikes"].mean().item(), preds, logits
 
 
 def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
@@ -173,6 +192,7 @@ def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
     print(f"[encoding] {modality}: mean input event rate = "
           f"{float((Rtr != 0).float().mean()):.3f}")
 
+    n_in = Rtr.shape[-1]  # 2 for single-channel ECG/PPG, 2*n_montage for EEG
     class_weight = _class_weights(ytr_t, n_classes)
     print(f"[train] {modality}: class weights = {class_weight.tolist()}")
     lossfn = nn.CrossEntropyLoss(weight=class_weight)
@@ -180,7 +200,7 @@ def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
     best_val_bal_acc, best_state = -1.0, None
     for restart in range(n_restarts):
         torch.manual_seed(seed * 100 + restart)
-        net = rm.build_xylo_snn(n_hidden=n_hidden, n_out=n_classes)
+        net = rm.build_xylo_snn(n_hidden=n_hidden, n_out=n_classes, n_in=n_in)
         # `.astorch()` hands Rockpool's Parameter dict to a torch optimizer
         # as the flat leaf-Parameter iterable it expects (see build_xylo_snn
         # docstring for why bias is NOT frozen like tau/threshold).
@@ -202,33 +222,68 @@ def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
                     loss = loss + bias_reg * (net[3].bias ** 2)
                 loss.backward()
                 opt.step()
-            _val_acc, val_bal_acc, _val_recalls, _, _ = _eval(net, Rval, yval_t, n_classes)
+            _val_acc, val_bal_acc, _val_recalls, _, _, _val_logits = \
+                _eval(net, Rval, yval_t, n_classes)
             if val_bal_acc > best_val_bal_acc:
                 best_val_bal_acc = val_bal_acc
                 best_state = copy.deepcopy(net.state_dict())
         print(f"[train] {modality} restart {restart}: "
               f"best-so-far val balanced accuracy = {best_val_bal_acc:.3f}")
 
-    net = rm.build_xylo_snn(n_hidden=n_hidden, n_out=n_classes)
+    net = rm.build_xylo_snn(n_hidden=n_hidden, n_out=n_classes, n_in=n_in)
     net.load_state_dict(best_state)
     print(f"[train] {modality}: final best val balanced accuracy = {best_val_bal_acc:.3f}")
 
-    float_acc, float_bal_acc, float_recalls, mean_hidden_rate, float_preds = \
+    float_acc, float_bal_acc, float_recalls, mean_hidden_rate, float_preds, float_logits = \
         _eval(net, Rte, yte_t, n_classes)
     spec = rm.map_and_quantize(net)
     _config, is_valid, msg = rm._xylo_support().config_from_specification(**spec)
     print(f"[xylo] {modality}: config_from_specification is_valid={is_valid} ({msg})")
 
+    # Real-world seconds spanned by one window, from the (possibly resampled)
+    # window length and the data's own (possibly rescaled) fs — generic
+    # across modalities; only EEG's false-alarms-per-hour metric uses it.
+    window_sec = float(Xte.shape[-1] / data.fs)
+
     return {
         "modality": modality, "source": data.source, "net": net, "spec": spec,
-        "n_hidden": n_hidden, "n_out": n_classes,
+        "n_hidden": n_hidden, "n_out": n_classes, "n_in": n_in,
         "n_samples": int(data.X.shape[0]), "provenance": card.provenance,
-        "requested_real": bool(data.requested_real),
+        "requested_real": bool(data.requested_real), "window_sec": window_sec,
         "Rte": Rte, "yte_t": yte_t, "float_preds": float_preds,
+        "float_logits": float_logits,
         "float_acc": float_acc, "float_bal_acc": float_bal_acc,
         "float_recalls": float_recalls, "mean_hidden_rate": mean_hidden_rate,
         "is_valid": is_valid,
     }
+
+
+def _eeg_extra_metrics(y_t, preds, scores: np.ndarray, window_sec: float) -> dict:
+    """Sensitivity/specificity/AUROC/AUPRC/false-alarms-per-hour — the
+    clinically standard seizure-detector metrics (docs/eeg_seizure_task.md),
+    reported INSTEAD OF accuracy given extreme class imbalance (per-class
+    recall alone doesn't give a threshold-free ranking measure, hence AUROC/
+    AUPRC; false-alarms/hour is the standard "does this device cry wolf"
+    metric). `scores` is a continuous positive-class score (softmax
+    probability for the float model, normalized spike-count share for
+    XyloSim, since XyloSim has no continuous membrane readout) used only for
+    AUROC/AUPRC ranking, not the classification decision itself.
+    """
+    y_np = y_t.numpy() if hasattr(y_t, "numpy") else np.asarray(y_t)
+    preds_np = preds.numpy() if hasattr(preds, "numpy") else np.asarray(preds)
+    n_pos, n_neg = int((y_np == 1).sum()), int((y_np == 0).sum())
+    sensitivity = float(((preds_np == 1) & (y_np == 1)).sum() / n_pos) if n_pos else float("nan")
+    specificity = float(((preds_np == 0) & (y_np == 0)).sum() / n_neg) if n_neg else float("nan")
+    fp = int(((preds_np == 1) & (y_np == 0)).sum())
+    neg_hours = (n_neg * window_sec) / 3600.0
+    fa_per_hour = float(fp / neg_hours) if neg_hours > 0 else float("nan")
+    auroc = auprc = float("nan")
+    if len(np.unique(y_np)) > 1:
+        from sklearn.metrics import average_precision_score, roc_auc_score
+        auroc = float(roc_auc_score(y_np, scores))
+        auprc = float(average_precision_score(y_np, scores))
+    return {"sensitivity": sensitivity, "specificity": specificity,
+            "auroc": auroc, "auprc": auprc, "fa_per_hour": fa_per_hour}
 
 
 def verify_modality(result: dict, max_verify: int) -> dict:
@@ -245,10 +300,12 @@ def verify_modality(result: dict, max_verify: int) -> dict:
     n_verify = min(max_verify, Rte.shape[0])
     matches = 0
     xylo_preds = torch.empty(n_verify, dtype=torch.long)
+    xylo_out = np.empty((n_verify, n_classes), dtype=np.float64)
     for i in range(n_verify):
         res = rm.verify_against_sim(net, spec, Rte[i].numpy())
         matches += int(res["match"])
         xylo_preds[i] = res["pred_xylo"]
+        xylo_out[i] = res["out_xylo"]
     yte_slice = yte_t[:n_verify]
     xylo_acc = (xylo_preds == yte_slice).float().mean().item()
     xylo_bal_acc = balanced_accuracy(xylo_preds, yte_slice, n_classes)
@@ -269,11 +326,32 @@ def verify_modality(result: dict, max_verify: int) -> dict:
     print(f"XyloSim per-class recall : {[f'{r:.3f}' for r in xylo_recalls]}")
     print(f"Float vs. XyloSim agree  : {agreement_rate:.3f}")
     print(f"Mean hidden spike rate   : {result['mean_hidden_rate']:.3f}")
-    print("=" * 60)
 
     result.update(xylo_acc=xylo_acc, xylo_bal_acc=xylo_bal_acc,
                    xylo_recalls=xylo_recalls, agreement_rate=agreement_rate,
                    n_verify=n_verify)
+
+    if modality == "eeg" and n_classes == 2:
+        # Accuracy is meaningless under CHB-MIT's extreme imbalance — report
+        # the clinical seizure-detector metrics instead (docs/eeg_seizure_task.md).
+        window_sec = result["window_sec"]
+        float_probs = torch.softmax(
+            result["float_logits"][:n_verify], dim=1)[:, 1].numpy()
+        xylo_scores = xylo_out[:, 1] / (xylo_out.sum(axis=1) + 1e-8)
+        float_eeg = _eeg_extra_metrics(yte_slice, result["float_preds"][:n_verify],
+                                        float_probs, window_sec)
+        xylo_eeg = _eeg_extra_metrics(yte_slice, xylo_preds, xylo_scores, window_sec)
+        print(f"Float  sens/spec/AUROC/AUPRC/FA-per-hr: "
+              f"{float_eeg['sensitivity']:.3f} / {float_eeg['specificity']:.3f} / "
+              f"{float_eeg['auroc']:.3f} / {float_eeg['auprc']:.3f} / "
+              f"{float_eeg['fa_per_hour']:.2f}")
+        print(f"XyloSim sens/spec/AUROC/AUPRC/FA-per-hr: "
+              f"{xylo_eeg['sensitivity']:.3f} / {xylo_eeg['specificity']:.3f} / "
+              f"{xylo_eeg['auroc']:.3f} / {xylo_eeg['auprc']:.3f} / "
+              f"{xylo_eeg['fa_per_hour']:.2f}")
+        result.update(float_eeg_metrics=float_eeg, xylo_eeg_metrics=xylo_eeg)
+
+    print("=" * 60)
     return result
 
 
@@ -379,14 +457,32 @@ def _print_multiseed_summary(modality: str, seed_results: list) -> None:
     print(f"XyloSim per-class recall : "
           f"{[f'{m:.3f}+/-{s:.3f}' for m, s in zip(xr_m, xr_s)]}")
     print(f"Float vs. XyloSim agree  : {ag_m:.3f} +/- {ag_s:.3f}")
+
+    if "float_eeg_metrics" in seed_results[0]:
+        def _stat_eeg(net_key, metric_key):
+            vals = np.array([r[net_key][metric_key] for r in seed_results], dtype=float)
+            return float(np.nanmean(vals)), float(np.nanstd(vals))
+
+        for net_key, label in (("float_eeg_metrics", "Float"),
+                                ("xylo_eeg_metrics", "XyloSim")):
+            sens_m, sens_s = _stat_eeg(net_key, "sensitivity")
+            spec_m, spec_s = _stat_eeg(net_key, "specificity")
+            auroc_m, auroc_s = _stat_eeg(net_key, "auroc")
+            auprc_m, auprc_s = _stat_eeg(net_key, "auprc")
+            fa_m, fa_s = _stat_eeg(net_key, "fa_per_hour")
+            print(f"{label:8} sensitivity/specificity : "
+                  f"{sens_m:.3f}+/-{sens_s:.3f} / {spec_m:.3f}+/-{spec_s:.3f}")
+            print(f"{label:8} AUROC/AUPRC             : "
+                  f"{auroc_m:.3f}+/-{auroc_s:.3f} / {auprc_m:.3f}+/-{auprc_s:.3f}")
+            print(f"{label:8} false alarms/hour       : {fa_m:.2f}+/-{fa_s:.2f}")
     print("=" * 60)
 
 
 def main():
     ap = argparse.ArgumentParser(description="Per-modality XyloSim verification")
-    ap.add_argument("--modality", choices=["ecg", "ppg", "both"], default="both")
+    ap.add_argument("--modality", choices=["ecg", "ppg", "eeg", "both"], default="both")
     ap.add_argument("--real", action="store_true",
-                     help="use real data (MIT-BIH for ecg, BIDMC for ppg)")
+                     help="use real data (MIT-BIH for ecg, BIDMC for ppg, CHB-MIT for eeg)")
     ap.add_argument("--require-real", action="store_true",
                      help="raise instead of silently falling back to synthetic "
                           "if real data fails to load (implies --real)")
@@ -445,6 +541,27 @@ def main():
                           "agreement is not reliable evidence on its own (see "
                           "docs/ecg_quant_fixes_results.md's checkpoint-"
                           "sensitivity finding).")
+    ap.add_argument("--eeg-subjects", type=str, default=None,
+                     help="comma-separated CHB-MIT subject ids (e.g. "
+                          "chb01,chb02,chb03) — default: "
+                          "datasets.DEFAULT_EEG_SUBJECTS. NOTE: the same "
+                          "subject pool is used for every --n-seeds seed "
+                          "(only the train/val/test patient split and net "
+                          "init vary by seed), matching the VitalDB "
+                          "multi-seed design.")
+    ap.add_argument("--neg-per-record", type=int, default=None,
+                     help="eeg only: cap on non-seizure windows kept per "
+                          "CHB-MIT record (default: load_chbmit's own "
+                          "default of 60). ALL seizure windows are always kept.")
+    ap.add_argument("--eeg-seizure-records", type=int, default=None,
+                     help="eeg only: seizure-containing records to use per "
+                          "subject (default: load_chbmit's own default of 2). "
+                          "Lower this to cut download volume.")
+    ap.add_argument("--eeg-nonseizure-records", type=int, default=None,
+                     help="eeg only: non-seizure records to use per subject "
+                          "for background diversity (default: load_chbmit's "
+                          "own default of 1). Set to 0 to skip entirely and "
+                          "cut download volume.")
     args = ap.parse_args()
     real = args.real or args.require_real
     loader_kwargs = {}
@@ -459,6 +576,18 @@ def main():
         if args.max_cases is not None:
             ppg_loader_kwargs["max_cases"] = args.max_cases
 
+    eeg_loader_kwargs = {}
+    if args.resample_to is not None:
+        eeg_loader_kwargs["resample_to"] = args.resample_to
+    if args.eeg_subjects is not None:
+        eeg_loader_kwargs["subjects"] = [s.strip() for s in args.eeg_subjects.split(",")]
+    if args.neg_per_record is not None:
+        eeg_loader_kwargs["neg_per_record"] = args.neg_per_record
+    if args.eeg_seizure_records is not None:
+        eeg_loader_kwargs["seizure_records_per_subject"] = args.eeg_seizure_records
+    if args.eeg_nonseizure_records is not None:
+        eeg_loader_kwargs["nonseizure_records_per_subject"] = args.eeg_nonseizure_records
+
     modalities = ["ecg", "ppg"] if args.modality == "both" else [args.modality]
     n_seeds = max(1, args.n_seeds)
 
@@ -468,6 +597,8 @@ def main():
         if modality == "ppg":
             loader = _PPG_SOURCE_LOADERS[args.ppg_source]
             mod_loader_kwargs = ppg_loader_kwargs
+        elif modality == "eeg":
+            mod_loader_kwargs = eeg_loader_kwargs
 
         seed_results = []
         for s in range(n_seeds):

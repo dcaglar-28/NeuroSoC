@@ -15,6 +15,12 @@ env/
 data/
 !data/.gitkeep
 
+# wfdb's EDF reader (used for CHB-MIT) writes local cache copies into the
+# CURRENT WORKING DIRECTORY as a side effect of streaming from pn_dir=... —
+# separate from and in addition to this repo's own data/chbmit/ cache.
+*.edf
+*.edf.seizures
+
 # Model checkpoints & outputs
 checkpoints/
 outputs/
