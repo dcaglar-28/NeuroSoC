@@ -20,6 +20,13 @@ data/
 # separate from and in addition to this repo's own data/chbmit/ cache.
 *.edf
 *.edf.seizures
+*.npy
+*.npz
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Model checkpoints & outputs
 checkpoints/

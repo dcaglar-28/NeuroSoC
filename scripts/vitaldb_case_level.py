@@ -36,7 +36,7 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from xylo_verify import (  # noqa: E402  (sibling script, not a package import)
-    _class_weights, _encode_batch, balanced_accuracy, per_class_recall,
+    _class_weights, _encode_batch, balanced_accuracy,
 )
 
 from eia import case_level, report, rockpool_models as rm  # noqa: E402
@@ -65,7 +65,6 @@ def train_window_model(data, seed: int, epochs: int, n_hidden: int,
     Rte = torch.tensor(_encode_batch(Xte, threshold))
     ytr_t = torch.tensor(ytr)
     yval_t = torch.tensor(yval)
-    yte_t = torch.tensor(yte)
 
     class_weight = _class_weights(ytr_t, n_classes)
     print(f"[train] vitaldb (case-level): class weights = {class_weight.tolist()}")

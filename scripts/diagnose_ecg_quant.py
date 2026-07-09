@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(__file__))
-from xylo_verify import train_modality, per_class_recall, balanced_accuracy  # noqa: E402
+from xylo_verify import train_modality, balanced_accuracy  # noqa: E402
 
 from eia import rockpool_models as rm  # noqa: E402
 
