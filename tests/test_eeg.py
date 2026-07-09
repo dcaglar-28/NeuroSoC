@@ -5,6 +5,7 @@ docs/eeg_seizure_task.md."""
 
 import os
 import sys
+import time
 from unittest.mock import patch
 
 import numpy as np
@@ -267,3 +268,147 @@ def test_eeg_eligible_patients_requires_at_least_two_records():
     eligible = _eeg_eligible_patients(d)
     assert "chb01" in eligible
     assert "chb99" not in eligible  # only 1 record for chb99
+
+
+# --------------------------------------------------------------------------- #
+# Resumable/watchable load_chbmit: timeout wrapper + cache-hit short-circuit.
+# No network in any of these -- see docs/eeg_seizure_task.md's "hung for
+# hours" problem this responds to.
+# --------------------------------------------------------------------------- #
+
+
+def test_call_with_timeout_returns_result_on_success():
+    result, err = datasets._call_with_timeout(lambda x: x * 2, 5.0, 0, 21)
+    assert result == 42
+    assert err is None
+
+
+def test_call_with_timeout_times_out_on_slow_callable():
+    def _slow():
+        time.sleep(5.0)
+        return "too late"
+
+    t0 = time.time()
+    result, err = datasets._call_with_timeout(_slow, 0.2, 0)
+    elapsed = time.time() - t0
+
+    assert result is None
+    assert isinstance(err, TimeoutError)
+    # Returns promptly at the timeout, not after the full 5s sleep -- this
+    # is the exact "one stalled connection hangs the whole cell" bug fix.
+    assert elapsed < 2.0
+
+
+def test_call_with_timeout_reports_exception_without_hanging():
+    def _boom():
+        raise ValueError("network is on fire")
+
+    result, err = datasets._call_with_timeout(_boom, 5.0, 0)
+    assert result is None
+    assert isinstance(err, ValueError)
+    assert "on fire" in str(err)
+
+
+def test_call_with_timeout_retries_before_succeeding():
+    calls = {"n": 0}
+
+    def _flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise ConnectionError("transient")
+        return "ok on 3rd try"
+
+    result, err = datasets._call_with_timeout(_flaky, 5.0, 2)
+    assert result == "ok on 3rd try"
+    assert err is None
+    assert calls["n"] == 3
+
+
+def test_call_with_timeout_gives_up_after_exhausting_retries():
+    calls = {"n": 0}
+
+    def _always_fails():
+        calls["n"] += 1
+        raise RuntimeError("nope")
+
+    result, err = datasets._call_with_timeout(_always_fails, 5.0, 2)
+    assert result is None
+    assert isinstance(err, RuntimeError)
+    assert calls["n"] == 3  # 1 initial attempt + 2 retries
+
+
+def test_load_chbmit_record_montage_cache_hit_skips_network(tmp_path):
+    cache_dir = str(tmp_path)
+    np.savez(os.path.join(cache_dir, "chb01_chb01_01_montage.npz"),
+             sig=np.zeros((100, 6), dtype="float32"), fs=32.0)
+
+    with patch("wfdb.io.convert.edf.read_edf") as mock_read:
+        sig, fs = datasets._load_chbmit_record_montage(
+            "chb01", "chb01_01", datasets.EEG_MONTAGE, cache_dir)
+
+    mock_read.assert_not_called()
+    assert fs == 32.0
+    assert sig.shape == (100, 6)
+
+
+def test_load_chbmit_reports_plan_and_skips_failing_record(capsys):
+    """Fully offline run of load_chbmit's orchestration: mocks the two
+    network-touching helpers so no PhysioNet access happens, pre-seeds one
+    record's cache to prove cache hits are detected and reported, and makes
+    a second record's "network" call always fail to prove a stuck/failing
+    record is skipped (not raised) and the run still completes using
+    whatever else succeeded.
+    """
+    fake_summary = {
+        "chb01_01": [],           # non-seizure
+        "chb01_02": [(10, 14)],   # 1 seizure, 10-14s
+    }
+
+    def fake_fetch_summary(subject, cache_dir, timeout_sec=30.0):
+        assert subject == "chb01"
+        return fake_summary
+
+    def fake_load_record(subject, record, montage, cache_dir):
+        if record == "chb01_02":
+            raise RuntimeError("simulated stalled connection")
+        # chb01_01: 20s of signal at 256 Hz, 6 montage channels.
+        return np.zeros((20 * 256, 6), dtype="float32"), 256.0
+
+    with patch.object(datasets, "_fetch_chbmit_summary", side_effect=fake_fetch_summary), \
+         patch.object(datasets, "_load_chbmit_record_montage", side_effect=fake_load_record):
+        data = datasets.load_chbmit(
+            subjects=["chb01"], seizure_records_per_subject=1,
+            nonseizure_records_per_subject=1, cache_dir="/tmp/does-not-matter",
+            record_timeout_sec=1.0, retries=0)
+
+    out = capsys.readouterr().out
+    assert "[chbmit] plan: 2 records total" in out
+    assert "[warn] chbmit chb01/chb01_02: failed to load" in out
+    assert "skipping record" in out
+    # Only chb01_01's windows made it into the returned data.
+    assert set(data.record_ids.tolist()) == {"chb01_01"}
+    assert data.X.shape[0] > 0
+
+
+def test_load_chbmit_plan_counts_cached_records(tmp_path, capsys):
+    """A pre-populated cache_dir should be reported as cache hits in the
+    plan line, not re-"downloaded" -- the resumability this whole thing is
+    for."""
+    cache_dir = str(tmp_path)
+    np.savez(os.path.join(cache_dir, "chb01_chb01_01_montage.npz"),
+             sig=np.zeros((20 * 256, 6), dtype="float32"), fs=256.0)
+
+    fake_summary = {"chb01_01": []}
+
+    def fake_fetch_summary(subject, cache_dir, timeout_sec=30.0):
+        return fake_summary
+
+    with patch.object(datasets, "_fetch_chbmit_summary", side_effect=fake_fetch_summary):
+        data = datasets.load_chbmit(
+            subjects=["chb01"], seizure_records_per_subject=0,
+            nonseizure_records_per_subject=1, cache_dir=cache_dir)
+
+    out = capsys.readouterr().out
+    assert "[chbmit] plan: 1 records total (1 cached, 0 to download" in out
+    assert "cache hit" in out
+    assert data.X.shape[0] > 0

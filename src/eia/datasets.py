@@ -676,14 +676,62 @@ def _label_seizure_window(t0: float, t1: float, seizures: list) -> int:
     return int(any(t0 < e and t1 > s for s, e in seizures))
 
 
-def _fetch_chbmit_summary(subject: str, cache_dir: str) -> dict:
+def _call_with_timeout(fn, timeout_sec: float, retries: int = 0, *args, **kwargs):
+    """Run `fn(*args, **kwargs)` in a daemon thread with a wall-clock
+    timeout, retrying up to `retries` times on timeout or exception. Returns
+    `(result, None)` on success, `(None, error)` if every attempt failed —
+    never raises, so callers can skip-and-continue uniformly (mirrors the
+    existing "skip records/subjects that fail to load" behavior in
+    `load_chbmit`).
+
+    A thread, not `signal.alarm`: works the same on Colab (Linux) and
+    locally (macOS/Windows), and lets tests exercise it directly with a
+    deliberately slow dummy callable — no real network or platform-specific
+    signal delivery needed. The thread is a daemon and is NOT forcibly
+    killed on timeout (Python has no safe way to kill a thread); a
+    genuinely stuck network call keeps running in the background after we
+    give up on it, but that's harmless here since each attempt only ever
+    touches its own local variables / cache file, never shared state.
+    """
+    import threading
+
+    last_err: Exception | None = None
+    for _attempt in range(retries + 1):
+        outcome: dict = {}
+
+        def _target():
+            try:
+                outcome["value"] = fn(*args, **kwargs)
+            except Exception as e:  # noqa: BLE001 — reported to the caller, not raised here
+                outcome["error"] = e
+
+        t = threading.Thread(target=_target, daemon=True)
+        t.start()
+        t.join(timeout_sec)
+        if t.is_alive():
+            last_err = TimeoutError(f"timed out after {timeout_sec:.0f}s")
+            continue
+        if "error" in outcome:
+            last_err = outcome["error"]
+            continue
+        return outcome.get("value"), None
+    return None, last_err
+
+
+def _fetch_chbmit_summary(subject: str, cache_dir: str, timeout_sec: float = 30.0) -> dict:
     import os
     import urllib.request
     os.makedirs(cache_dir, exist_ok=True)
     path = os.path.join(cache_dir, f"{subject}-summary.txt")
     if not os.path.exists(path):
         url = f"https://physionet.org/files/chbmit/1.0.0/{subject}/{subject}-summary.txt"
-        urllib.request.urlretrieve(url, path)
+        # urlretrieve has no timeout knob; urlopen does — a stalled connect
+        # or read on this small text file shouldn't be able to hang forever
+        # any more than the big EDF pulls below can.
+        with urllib.request.urlopen(url, timeout=timeout_sec) as resp:
+            data = resp.read()
+        with open(path, "wb") as f:
+            f.write(data)
     with open(path, "r", errors="ignore") as f:
         text = f.read()
     return parse_chbmit_summary(text)
@@ -721,6 +769,9 @@ def load_chbmit(
     neg_per_record: int = 60,
     cache_dir: str = "data/chbmit",
     seed: int = 0,
+    verbose: bool = True,
+    record_timeout_sec: float = 300.0,
+    retries: int = 1,
 ) -> EegData:
     """Stream CHB-MIT scalp EEG, windowed and labelled for seizure detection.
 
@@ -728,6 +779,20 @@ def load_chbmit(
     fixed 6-channel bipolar montage (`EEG_MONTAGE`) -> band-pass to the
     seizure band -> per-window z-score -> FFT-resample to `resample_to`
     Xylo timesteps. Requires `wfdb` (`pip install 'eia[data]'`) and network.
+
+    Resumable and watchable (each ~40MB EDF pull used to be silent and
+    unbounded, so a big subject list just looked hung for hours, and one
+    stalled PhysioNet connection could hang the whole call forever):
+    prints the full download plan (total/cached/to-download) up front, then
+    per-record progress with elapsed time and a running window count, and
+    wraps every network call (the summary fetch AND each record's EDF read)
+    in a wall-clock timeout with an optional retry — a stuck record is
+    skipped, exactly like a record that fails to load for any other reason,
+    never a hang. Already-cached records (see `_load_chbmit_record_montage`)
+    are instant and reported as cache hits, so resuming an interrupted pull
+    (e.g. after a Colab runtime reset, if `cache_dir` persists — see
+    `notebooks/02_eeg_seizure.ipynb`'s optional Drive-mount cell) only pays
+    for what's still missing.
 
     Args:
         subjects: CHB-MIT subject ids to pull from (default
@@ -751,6 +816,17 @@ def load_chbmit(
             ALL seizure windows in a chosen record are always kept.
         cache_dir: per-record montage cache (gitignored `data/`).
         seed: controls which negative windows are subsampled per record.
+        verbose: print the download plan and per-record progress (elapsed
+            time, cache-hit/download, running window count). `[warn]` lines
+            for skipped subjects/records always print regardless of this —
+            provenance/failures are never silent, matching every other
+            loader's `require_real`/fallback convention in this module.
+        record_timeout_sec: wall-clock cap on each summary fetch and each
+            record's EDF read (via `_call_with_timeout`, a daemon-thread
+            timeout — portable across Colab/local, no `signal.alarm`). A
+            record that times out is skipped, same as one that raises.
+        retries: extra attempts (beyond the first) per summary fetch / EDF
+            read before giving up and skipping.
 
     Returns:
         EegData with `source="chbmit"`, `groups` = canonical patient id per
@@ -761,48 +837,84 @@ def load_chbmit(
     except ImportError as e:  # pragma: no cover
         raise ImportError("Install the data extra: pip install 'eia[data]'") from e
 
+    import os
+    import time
+
     subjects = subjects or DEFAULT_EEG_SUBJECTS
     montage = montage or EEG_MONTAGE
     rng = np.random.default_rng(seed)
     window_native = int(round(window_sec * EEG_NATIVE_FS))
 
-    X_list, y_list, group_list, record_list = [], [], [], []
-    for subject in subjects:
-        try:
-            summary = _fetch_chbmit_summary(subject, cache_dir)
-        except Exception as e:
-            print(f"[warn] chbmit {subject}: failed to fetch summary ({e}); skipping subject.")
-            continue
+    def _cache_path(subject, record):
+        return os.path.join(cache_dir, f"{subject}_{record}_montage.npz")
 
+    # Phase 1: fetch each subject's summary (small text file) and enumerate
+    # the records to pull, so the FULL plan — including cache-hit/miss for
+    # every record — can be printed before any ~40MB EDF download starts.
+    summaries: dict = {}
+    plan: list = []  # [(subject, record), ...]
+    for subject in subjects:
+        summary, err = _call_with_timeout(
+            _fetch_chbmit_summary, record_timeout_sec, retries, subject, cache_dir)
+        if err is not None:
+            print(f"[warn] chbmit {subject}: failed to fetch summary ({err}); skipping subject.")
+            continue
+        summaries[subject] = summary
         seizure_recs = sorted(r for r, sz in summary.items() if sz)[:seizure_records_per_subject]
         nonseizure_recs = sorted(
             r for r, sz in summary.items() if not sz)[:nonseizure_records_per_subject]
+        plan.extend((subject, record) for record in seizure_recs + nonseizure_recs)
 
-        for record in seizure_recs + nonseizure_recs:
-            try:
-                sig, fs = _load_chbmit_record_montage(subject, record, montage, cache_dir)
-            except Exception as e:
-                print(f"[warn] chbmit {subject}/{record}: failed to load ({e}); skipping record.")
-                continue
+    n_cached = sum(1 for s, r in plan if os.path.exists(_cache_path(s, r)))
+    if verbose:
+        print(f"[chbmit] plan: {len(plan)} records total "
+              f"({n_cached} cached, {len(plan) - n_cached} to download, "
+              f"cache_dir={cache_dir!r})")
 
-            filtered = bandpass_eeg(sig, fs, band_pass)
-            n_windows = filtered.shape[0] // window_native
-            seizures = summary.get(record, [])
+    # Phase 2: load each planned record — cache hits are near-instant, a
+    # download is the ~40MB/record cost the plan above just quantified.
+    X_list, y_list, group_list, record_list = [], [], [], []
+    for i, (subject, record) in enumerate(plan, 1):
+        cache_hit = os.path.exists(_cache_path(subject, record))
+        if verbose:
+            print(f"[chbmit] {subject}/{record} ({i}/{len(plan)}) "
+                  f"{'cache hit' if cache_hit else 'downloading...'}")
 
-            pos_w, neg_w = [], []
-            for w in range(n_windows):
-                t0, t1 = w * window_native / fs, (w + 1) * window_native / fs
-                (pos_w if _label_seizure_window(t0, t1, seizures) else neg_w).append(w)
-            if len(neg_w) > neg_per_record:
-                neg_w = list(rng.choice(neg_w, size=neg_per_record, replace=False))
+        t0 = time.time()
+        loaded, err = _call_with_timeout(
+            _load_chbmit_record_montage, record_timeout_sec, retries,
+            subject, record, montage, cache_dir)
+        elapsed = time.time() - t0
+        if err is not None:
+            print(f"[warn] chbmit {subject}/{record}: failed to load "
+                  f"({err}) after {elapsed:.0f}s; skipping record.")
+            continue
+        sig, fs = loaded
 
-            patient = eeg_canonical_patient(subject)
-            for w in pos_w + neg_w:
-                seg = filtered[w * window_native:(w + 1) * window_native, :].T  # (n_ch, window)
-                X_list.append(seg.astype(np.float32))
-                y_list.append(1 if w in pos_w else 0)
-                group_list.append(patient)
-                record_list.append(record)
+        filtered = bandpass_eeg(sig, fs, band_pass)
+        n_windows = filtered.shape[0] // window_native
+        seizures = summaries[subject].get(record, [])
+
+        pos_w, neg_w = [], []
+        for w in range(n_windows):
+            tw0, tw1 = w * window_native / fs, (w + 1) * window_native / fs
+            (pos_w if _label_seizure_window(tw0, tw1, seizures) else neg_w).append(w)
+        if len(neg_w) > neg_per_record:
+            neg_w = list(rng.choice(neg_w, size=neg_per_record, replace=False))
+
+        patient = eeg_canonical_patient(subject)
+        for w in pos_w + neg_w:
+            seg = filtered[w * window_native:(w + 1) * window_native, :].T  # (n_ch, window)
+            X_list.append(seg.astype(np.float32))
+            y_list.append(1 if w in pos_w else 0)
+            group_list.append(patient)
+            record_list.append(record)
+
+        if verbose:
+            n_this_record = len(pos_w) + len(neg_w)
+            verb = "loaded" if cache_hit else "downloaded"
+            print(f"[chbmit]   {verb} in {elapsed:.1f}s -- "
+                  f"{n_this_record} windows this record, {len(X_list)} cumulative")
 
     if not X_list:
         raise RuntimeError("No EEG windows extracted from CHB-MIT.")
