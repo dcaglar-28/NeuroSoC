@@ -1,5 +1,10 @@
 # EEG seizure detection on CHB-MIT — measured results (Phase 1)
 
+> **RETIRED/PAUSED** — code removed 2026-07-13; findings preserved. EEG
+> seizure detection came back ~chance under raw and feature front-ends;
+> paused pending a richer montage without the 16-input Xylo ceiling (Akida
+> headroom) and/or more patients. Recoverable from git history.
+
 Implements `docs/eeg_seizure_task.md` (MARCH "H", Phase 1). Part 1 is the
 subject-independent seizure-vs-non-seizure result for the new EEG modality —
 the second real-data workstream in this repo alongside ECG, reported on its

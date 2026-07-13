@@ -1,5 +1,10 @@
 # EEG front-end redesign — measured results
 
+> **RETIRED/PAUSED** — code removed 2026-07-13; findings preserved. EEG
+> seizure detection came back ~chance under raw and feature front-ends;
+> paused pending a richer montage without the 16-input Xylo ceiling (Akida
+> headroom) and/or more patients. Recoverable from git history.
+
 Implements `docs/eeg_frontend_task.md`, the follow-up to the settled diagnosis
 in `docs/eeg_seizure_results.md`: subject-independent AND patient-specific
 splits were both ~chance, and critically the **float** model (no chip, no

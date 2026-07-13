@@ -57,7 +57,7 @@ without waiting on Akida/MetaTF tooling access:
   spike-raster input. SDK = **Rockpool**; deploy/verify via the **XyloSim
   bit-accurate simulator** (no chip needed to validate).
 - The deploy METHOD (train -> quantize -> bit-exact sim -> verify) is
-  chip-agnostic, and the 1-D LIF nets built so far (ECG/PPG/EEG) are
+  chip-agnostic, and the 1-D LIF nets built so far (ECG/PPG/heart) are
   architecturally simple enough to port to either target.
 - Its fidelity numbers, however, are specifically **Xylo-toolchain-
   measured** and will need re-characterization after porting to
@@ -244,15 +244,17 @@ signals at accuracy comparable to a conventional net while doing far fewer
 operations — the basis for the low-power offline device. See `README.md`.
 
 Current state:
-- Two modalities working end-to-end: **ECG beat classification** and **PPG
-  classification** (`--modality {ecg,ppg}` on `train.py`).
+- Three modalities working end-to-end: **ECG beat classification**, **PPG
+  classification**, and **heart-sound (PCG) normal/abnormal classification**
+  (`--modality {ecg,ppg,heart}` on `train.py`).
 - `src/eia/`: `encoding.py` (event encoders, numpy), `energy.py` (analytical
   MAC-vs-SOP model, numpy), `datasets.py` (ECG: real MIT-BIH via wfdb + synthetic;
   PPG: real BIDMC via wfdb, real VitalDB via `vitaldb`, + synthetic — pick the
   PPG real source with `--ppg-source {bidmc,vitaldb}` on `train.py` /
-  `scripts/xylo_verify.py`), `models.py` (snnTorch SNN + dense baseline,
-  modality-agnostic), `device.py` (MPS/CPU), `train.py` (end-to-end demo +
-  `--sweep`, both modalities).
+  `scripts/xylo_verify.py`; heart: real PhysioNet/CinC 2016 via wfdb +
+  synthetic), `models.py` (snnTorch SNN + dense baseline, modality-agnostic),
+  `device.py` (MPS/CPU), `train.py` (end-to-end demo + `--sweep`, all
+  modalities).
 - Unit tests pass (`pytest -q`), numpy-only.
 - Verified running on the user's M-series Mac via MPS (torch 2.8), incl. `--real`
   for ECG (MIT-BIH), PPG (BIDMC), and PPG (VitalDB) with `wfdb`/`vitaldb` installed.
@@ -347,95 +349,47 @@ open labels.
 - **C (Circulation) — DONE.** ECG arrhythmia on real MIT-BIH is the one modality
   genuinely learning on real data (float balanced acc 0.845). On-chip XyloSim
   fidelity (~0.56) is the open engineering gap, not a data gap.
-- **H (Head) — Phase 1 EEG pipeline built and Xylo-verified. Front-end
-  redesign tested (feature-based: line length / band power / spectral
-  entropy) and it did NOT clear chance either — statistically indistinguishable
-  from the raw baseline on the same 4-patient pool, both splits. Front-end
-  representation is ruled out as the standalone fix; next suspects are
-  montage/channel choice and true data scale, neither attempted yet. See
-  docs/eeg_frontend_results.md (latest), docs/eeg_seizure_results.md, and
-  notebooks/02_eeg_seizure.ipynb (Colab, larger-scale rerun still useful for
-  the scale question).**
-  Split into two independent workstreams:
-  - **EEG:** seizure detection on **CHB-MIT** (open, WFDB-via-`read_edf`,
-    expert seizure labels, decades of benchmarks). Task spec:
-    `docs/eeg_seizure_task.md`. Built hardware-first (23ch native → fixed
-    6-channel bipolar montage → 0.5-25 Hz band-pass → resample to 128
-    timesteps → delta encoder → 12 spike channels → LIF SNN, `n_in=12` →
-    XyloSim; `input 12/16` in the footprint check, margin under the 16-channel
-    ceiling). Subject-independent split (patient-grouped, chb21 folded into
-    chb01) is wired and leakage-checked. **Part 1 measured (9 patients, 1
-    seizure record each — 718 windows, 5 seeds): float balanced acc
-    0.525 +/- 0.030, XyloSim 0.500 +/- 0.028, both flat at chance; AUROC
-    ~0.52-0.55; false alarms 300-325/hour (unusable as-is).**
-    **Part 2 — patient-specific diagnostic** (`--split patient-specific`,
-    `datasets.eeg_patient_specific_split`: holds out whole RECORDS within one
-    patient, never windows, to avoid within-patient temporal leakage) was
-    added specifically to disambiguate "too little cross-patient data" from
-    "the front-end destroyed the seizure signal." On the same 5-patient/
-    1072-window pool, subject-independent (0.513 +/- 0.016 bal acc) and
-    patient-specific (0.517 +/- 0.074 bal acc, AUROC 0.524 +/- 0.097, pooled
-    over 5 patients x 5 seeds) came back statistically indistinguishable —
-    **patient-specific is ALSO ~chance**, which per the diagnostic's own
-    decision rule points at the front-end as the more likely bottleneck, not
-    pure data volume. Caveat: this diagnostic run is itself still
-    data-constrained (2-3 records/patient); two patients with more seizure-
-    record diversity (chb02, chb03) showed a mild positive AUROC (~0.59-0.60)
-    — directionally against "front-end is hopeless," not decisive either way.
-    `notebooks/02_eeg_seizure.ipynb` (Colab-ready, verified to execute
-    end-to-end locally at reduced scale) reruns both splits with every
-    available seizure record per subject on a faster connection — run this
-    before committing to a front-end redesign. Local network was the binding
-    constraint throughout (PhysioNet throughput for CHB-MIT's ~40MB EDF files
-    varied 4-25+ min/record this session; several larger download attempts
-    were killed mid-run as impractically slow) — `data/chbmit/` caches every
-    record pulled so far, so scaling up is incremental, not a re-download.
-    Also found: `chb12/13/14/16/17/18/19/21` all fail to load via
-    `wfdb.io.convert.edf.read_edf` ("math domain error") — a real,
-    reproducible parser limitation, not guessed; excluded from
-    `datasets.DEFAULT_EEG_SUBJECTS`. Metrics reported are AUROC/AUPRC/
-    sensitivity/specificity/FA-per-hour, NOT accuracy (extreme imbalance),
-    per the task spec. Caveat: CHB-MIT is pediatric epilepsy, not field TBI.
-    **Part 3 — feature-based front-end redesign** (`eia.eeg_features`:
-    line length + relative delta/beta band power + spectral entropy per
-    0.5s sub-window, `eeg_frontend="features"` in `load_chbmit`, selectable
-    alongside the unchanged raw path via `--eeg-frontend`) responded
-    directly to Part 1/2's finding that the FLOAT model was at chance —
-    the classic hypothesis being that raw delta-encoding captures edges,
-    not the sustained rhythmic/spectral shift that defines a seizure.
-    **Measured on the same 4-patient/868-window pool, both splits, 5 seeds:
-    features did NOT clear chance either** (subject-independent bal acc
-    0.527 +/- 0.024 vs. raw's 0.551 +/- 0.042; patient-specific 0.488 +/- 0.073
-    vs. raw's 0.521 +/- 0.071 — nominally lower, well within noise of each
-    other, neither clearing 0.5 outside its own seed band). Notably, the two
-    patients (chb02, chb03) that showed raw's only mild positive signal
-    (~0.59 AUROC) dropped to ~0.47-0.48 under features — the opposite of
-    what "front-end was the bottleneck" would predict. Feature x channel
-    layout: 2 channels (`FEATURE_MONTAGE` = F7-T7, F8-T8) x 4 features =
-    8 feature-channels x2 (existing ON/OFF delta encoder, reused unchanged)
-    = 16 spike channels, confirmed `input 16/16` in the footprint — exactly
-    Xylo's ceiling, zero headroom (the committed Akida decision loosens
-    this, a concrete point in its favor). Per the task's explicit
-    instruction, NOT chased further (no bigger feature set, no channel
-    sweep) — see docs/eeg_frontend_results.md for the full honest write-up.
-    Next suspects, neither attempted: montage/channel choice (only 2 of 6
-    available channels used, purely to fit Xylo's budget) and true data
-    scale (4 patients is still small).
-    Phase 2 = TUSZ (registration-gated) + Siena generalization; Phase 3 = TBI
-    spectral screening (slowing, burst suppression) — a different task.
-  - **Thermal / hypothermia (later):** no open CHB-MIT-equivalent — likely a
-    build-your-own-dataset problem. Deferred.
+- **Heart sounds (cardiac auscultation, Circulation-adjacent) — DONE, the
+  second real-data modality.** Normal/abnormal PCG on PhysioNet/CinC 2016.
+  **Genuinely learns with a filterbank/band-power front-end** (float
+  balanced acc 0.593 +/- 0.041, AUROC 0.631 +/- 0.034, 5 seeds) — but the
+  first attempt, raw delta-encoded waveform downsampled to a Xylo timestep
+  budget, measured flat CHANCE (0.503/0.517) for a diagnosed, mechanistic
+  reason: the downsample-to-128-timesteps step drops the effective rate to
+  ~42.7 Hz (Nyquist ~21 Hz), below where 20-400+ Hz heart-sound content
+  lives, band-limiting the diagnostic signal away before the SNN sees it.
+  Fix: extract line-length/band-power/spectral-entropy features per
+  sub-window at/near native 2000 Hz FIRST, then reduce to a Xylo-sized
+  timestep count (24 sub-windows, `input 8/16`) — the same "reduce after
+  spectral extraction, not before" lesson EEG's front-end redesign taught.
+  XyloSim balanced acc (0.512 +/- 0.012) drops back toward chance despite
+  the float model learning — the ECG-shaped on-chip fidelity gap, not
+  chased further here (float-first ordering). See
+  `docs/heart_sounds_results.md` for the full write-up, including a
+  data-quality bug found and fixed along the way (a few CinC 2016
+  recordings have NaN samples the quality flag doesn't catch).
+- **H (Head) — RETIRED/PAUSED.** EEG seizure detection on CHB-MIT was built,
+  Xylo-verified, and diagnosed (subject-independent AND patient-specific
+  splits, both raw-waveform and feature-based front-ends) — all four
+  combinations came back ~chance. Code removed 2026-07-13 to declutter;
+  findings preserved in `docs/eeg_seizure_results.md` and
+  `docs/eeg_frontend_results.md` (each bannered RETIRED/PAUSED), recoverable
+  from git history. Paused pending a richer montage without the 16-input Xylo
+  ceiling (Akida headroom) and/or more patients — not attempted here since
+  heart sounds was the higher-confidence path to a second genuinely-learning
+  modality (see `docs/heart_sounds_task.md`'s framing).
 - **M (Massive hemorrhage) — PAUSED pending better physiology data.** VitalDB is
   settled ~chance (window + case level); revisit only with LBNP/CRM induced-
   hypovolemia data (request the gated Oslo/Yale sets, or build the synthetic
   time-resolved generator). The CRM feature recipe (`An Explainable ML Model for
   CRM`, MDPI Bioeng. 2023) is the method to use once real-physiology data exists.
-- **R (Respiration) — PAUSED.** BIDMC already carries a respiration channel
-  (currently only its PPG is used); pick up after H.
-- **A (Airway) — future work.** Needs breath/lung-sound audio, vision,
-  capnography — no data or model yet.
+- **R (Respiration) / A (Airway) — PAUSED. Lung sounds (ICBHI Respiratory
+  Sound Database) is the planned next modality** — also audio-class and
+  benchmarked like heart sounds, and it covers Respiration/Airway rather than
+  a second cardiac test. Not built yet. BIDMC also carries an unused
+  respiration channel (currently only its PPG is used) as a secondary option.
 
-After H/EEG lands, the fusion head (ECG + the next validated modality over a
+After heart sounds, the fusion head (ECG + the next validated modality over a
 MARCH timeline) and the ultrasound-probe path remain the longer-horizon steps.
 
 ## Working style
