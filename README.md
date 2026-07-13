@@ -11,6 +11,11 @@ hemorrhage-proxy classification** — each with the same event encoder, spiking
 neural network, conventional baseline, and analytical energy comparison.
 Additional modalities (heart & lung sounds, EEG) plug into the same pattern.
 
+**Hardware note:** the committed production target is the **BrainChip Akida**
+family (single vendor, MetaTF toolchain); **XyloSim** (below) is the current
+bit-exact validation vehicle, not the production silicon — see CLAUDE.md's
+"Hardware target" section for the full decision record.
+
 ## What's here
 
 ```

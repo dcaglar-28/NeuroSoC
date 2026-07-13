@@ -25,19 +25,46 @@ The full project brief is `EIA_Project_Brief.docx` in this folder.
 - Moat = offline milliwatt-scale multimodal integration + the MARCH stabilization
   loop. Buy silicon, don't build it.
 
-## Hardware targets (two tiers)
-- **Tier 1 — SynSense Xylo (primary, now):** ultra-low-power (~30-500 uW)
-  digital SNN core purpose-built for low-dimensional biosignals (ECG, PPG, EMG,
-  audio). Runs the always-on on-core waveform tests. This is the v1 target.
-  Constraints: LIF neurons only, ~1000 hidden neurons, few input channels, 8-bit
-  weights, spike-raster input. SDK = **Rockpool**; deploy/verify via the
-  **XyloSim bit-accurate simulator** (no chip needed to validate).
-- **Tier 2 — BrainChip Akida (intended extension, later):** larger event-based
-  processor that adds what Xylo cannot — 2-D convolution / vision (ultrasound,
-  thermal, retinal), deeper multimodal fusion networks, and on-chip learning.
-  Wakes intermittently for the docked-probe imaging + full MARCH fusion.
-- A real device could carry both: Xylo as always-on sentinel, Akida spun up for
-  imaging/fusion. Phase-0 code (1-D LIF MLPs on ECG/PPG) maps onto Xylo today.
+## Hardware target — production decision: BrainChip Akida (single vendor)
+**Committed production architecture is a single event-based neuromorphic
+vendor family: BrainChip Akida.** Akida Pico-class (sub-mW) core for the
+always-on 1-D biosignal cluster (ECG, PPG, EMG, audio-class waveforms); a
+larger Akida for 2-D imaging (docked-probe ultrasound/eFAST, thermal),
+deeper multimodal fusion, and on-chip (last-layer) learning. This **replaces
+the earlier two-vendor "Xylo primary now, Akida later" framing** — Akida is
+no longer just the later extension tier, it's the whole committed target.
+
+**Why one vendor, not two:** capability-completeness (one family spans 1-D
+signals, vision, fusion, and on-device learning — Xylo can't do the latter
+three at all) plus execution simplicity (one vendor, one toolchain =
+**MetaTF**, not two SDKs / two deploy paths / two co-residence stories)
+outweigh Xylo's lower idle power. A two-vendor architecture would still need
+Akida (or equivalent) for imaging/fusion/learning anyway, so collapsing to
+one vendor removes a whole integration axis for a device that already has
+enough moving parts.
+
+**Xylo/XyloSim's role now: the CURRENT bit-exact VALIDATION vehicle, not
+committed production silicon.** It stays in active use — everything below
+under "Xylo pipeline," "Xylo training/deploy specifics," the fidelity-gap
+root-cause diagnosis, and "Why not DynapSE-2" remains valid engineering
+knowledge, none of it invalidated by this decision — because Rockpool ->
+XyloSim is a mature, bit-exact simulator that lets the full
+train -> quantize -> verify pipeline be validated in software today,
+without waiting on Akida/MetaTF tooling access:
+- Ultra-low-power (~30-500 uW) digital SNN core purpose-built for
+  low-dimensional biosignals (ECG, PPG, EMG, audio). Constraints: LIF
+  neurons only, ~1000 hidden neurons, few input channels, 8-bit weights,
+  spike-raster input. SDK = **Rockpool**; deploy/verify via the **XyloSim
+  bit-accurate simulator** (no chip needed to validate).
+- The deploy METHOD (train -> quantize -> bit-exact sim -> verify) is
+  chip-agnostic, and the 1-D LIF nets built so far (ECG/PPG/EEG) are
+  architecturally simple enough to port to either target.
+- Its fidelity numbers, however, are specifically **Xylo-toolchain-
+  measured** and will need re-characterization after porting to
+  MetaTF/Akida — not assumed to carry over as-is.
+
+**Roadmap (future, not started, deferred until hardware access):**
+re-target the validated pipeline onto BrainChip MetaTF/Akida.
 
 ## Xylo pipeline (Rockpool)
 - `src/eia/models.py` (snnTorch) = fast local research. `src/eia/rockpool_models.py`
@@ -84,6 +111,9 @@ The full project brief is `EIA_Project_Brief.docx` in this folder.
   CE for us), `net.reset_state()` per sample, `loss.backward()`, `step()`.
 
 ## Float->XyloSim fidelity gap — ROOT CAUSE (diagnosed, see docs/ecg_quant_diagnosis.md)
+*(Xylo-toolchain-measured — see "Hardware target" above: Xylo/XyloSim is the
+current validation vehicle, not committed production silicon; these numbers
+will need re-characterization after porting to MetaTF/Akida.)*
 - The gap is **NOT** weight precision and **NOT** decay approximation. Ablation
   proved it: weight-only and dynamics-only float hybrids each reproduce 96.7-100%
   of float decisions — neither explains the real 20-44pt XyloSim disagreement. And
