@@ -19,11 +19,11 @@ import time
 import numpy as np
 
 from . import encoding, energy, report
-from .datasets import load_ecg, load_eeg, load_ppg, load_ppg_vitaldb
+from .datasets import load_ecg, load_heart, load_ppg, load_ppg_vitaldb
 from .device import get_device
 from .models import build_baseline, build_snn
 
-_LOADERS = {"ecg": load_ecg, "ppg": load_ppg, "eeg": load_eeg}
+_LOADERS = {"ecg": load_ecg, "ppg": load_ppg, "heart": load_heart}
 _PPG_SOURCE_LOADERS = {"bidmc": load_ppg, "vitaldb": load_ppg_vitaldb}
 
 
@@ -62,16 +62,19 @@ def run(real: bool = False, epochs: int = 10, hidden: int = 128,
           f"pos_frac={data.y.mean():.2f}  fs={data.fs}Hz")
 
     # models.py's snnTorch research path is single-channel (flattens (2,
-    # window) -> 2*window); EEG's multi-channel front end is handled
-    # properly in rockpool_models.py / scripts/xylo_verify.py instead (the
-    # hardware-accurate path). Here, flatten (n, channels, window) into
-    # (n, channels*window) so this fast-research pipeline runs unchanged —
-    # a documented simplification for this path only, not a deployment claim.
+    # window) -> 2*window); a multi-channel modality's front end would
+    # instead be handled properly in rockpool_models.py /
+    # scripts/xylo_verify.py (the hardware-accurate path). Here, flatten
+    # (n, channels, window) into (n, channels*window) so this fast-research
+    # pipeline runs unchanged for any such modality — a documented
+    # simplification for this path only, not a deployment claim. Currently
+    # dead for every registered modality (all are 2-D), kept as a cheap
+    # guard for the next multi-channel one.
     X_all = data.X.reshape(data.X.shape[0], -1) if data.X.ndim == 3 else data.X
 
-    # Case-grouped split when `data.groups` is set (VitalDB/EEG: many highly
-    # correlated windows share one case/patient-level label) — plain
-    # stratified split otherwise, unchanged from before.
+    # Case-grouped split when `data.groups` is set (VitalDB: many highly
+    # correlated windows share one case-level label) — plain stratified
+    # split otherwise, unchanged from before.
     if getattr(data, "groups", None) is not None:
         gss = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=seed)
         tr_idx, te_idx = next(gss.split(X_all, data.y, groups=data.groups))
@@ -198,11 +201,11 @@ def sweep(real: bool = False, epochs: int = 10, device_pref: str = "auto",
 
 def main():
     ap = argparse.ArgumentParser(description="EIA Phase-0 SNN demo")
-    ap.add_argument("--modality", default="ecg", choices=["ecg", "ppg", "eeg"],
+    ap.add_argument("--modality", default="ecg", choices=["ecg", "ppg", "heart"],
                     help="which physiological signal to classify")
     ap.add_argument("--real", action="store_true",
                     help="try real data (MIT-BIH for ecg, BIDMC for ppg, "
-                         "CHB-MIT for eeg)")
+                         "CinC 2016 for heart)")
     ap.add_argument("--require-real", action="store_true",
                     help="raise instead of silently falling back to synthetic "
                          "if real data fails to load (implies --real)")

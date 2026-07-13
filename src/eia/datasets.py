@@ -1,4 +1,4 @@
-"""ECG, PPG, and EEG dataset loading.
+"""ECG, PPG, and heart-sound dataset loading.
 
 Each modality has two paths:
   * a real loader streamed from PhysioNet via the `wfdb` package (needs
@@ -32,6 +32,36 @@ class EcgData:
 
 
 @dataclass
+class HeartData:
+    X: np.ndarray  # (n_samples, window) float32 — single-channel PCG, same
+                    # 2-D convention as EcgData (heart sounds are an
+                    # audio-class 1-D signal, same shape as ECG).
+    y: np.ndarray   # (n_samples,) int64 — 0 = normal, 1 = abnormal
+    fs: float       # sampling rate (Hz)
+    source: str     # "cinc2016" or "synthetic"
+    requested_real: bool = False
+    # Subject id per window, when recoverable. CinC 2016's distributed files
+    # (RECORDS/REFERENCE.csv/.hea headers — verified, not guessed; see
+    # docs/heart_sounds_task.md Part 0) do NOT expose a subject id, even
+    # though the dataset's own documentation confirms one subject may
+    # contribute 1-6 recordings — so this is always None for "cinc2016" and
+    # the split is by RECORDING, not by subject (documented caveat, not a
+    # silent gap). Kept for the same reason PpgData carries it: so a future
+    # subject-mapping (if one becomes available) slots in without an API
+    # change.
+    groups: np.ndarray | None = None
+    # "raw" (default, delta-encoded waveform, per-window self-normalized —
+    # X is (n_samples, window)) or "features" (docs/heart_sounds_task.md's
+    # escalation path: raw delta came back ~chance, murmurs are spectral —
+    # line length / relative band power / spectral entropy per sub-window
+    # via `eia.signal_features`, X becomes (n_samples, n_features,
+    # n_subwindows), NOT yet normalized — callers must run
+    # `signal_features.normalize_features_train_only` AFTER splitting, never
+    # before (train-only fit)). Real cinc2016 only; synthetic stays raw.
+    frontend: str = "raw"
+
+
+@dataclass
 class PpgData:
     X: np.ndarray  # (n_samples, window) float32
     y: np.ndarray  # (n_samples,) int64  — 0 = normal, 1 = abnormal
@@ -44,40 +74,6 @@ class PpgData:
     # callers must split by group instead of by window when this is set, to
     # avoid case-level leakage between train/val/test.
     groups: np.ndarray | None = None
-
-
-@dataclass
-class EegData:
-    X: np.ndarray  # (n_samples, n_channels, window) float32 — multi-channel,
-                    # unlike EcgData/PpgData's (n_samples, window): Xylo's
-                    # input framing needs one axis per montage channel, each
-                    # delta-encoded into its own ON/OFF pair (see
-                    # scripts/xylo_verify.py's `_encode_batch`).
-    y: np.ndarray   # (n_samples,) int64 — 0 = non-seizure, 1 = seizure
-    fs: float       # effective sampling rate (Hz) of the LAST axis (window),
-                    # i.e. after any resample_to — matches `report.data_card`'s
-                    # `duration_s = window / fs` for both 2-D and 3-D X.
-    source: str     # "chbmit" or "synthetic"
-    requested_real: bool = False
-    # Canonical patient id per window (chb21 folded into chb01 — see
-    # `eeg_canonical_patient`). Required: CHB-MIT's headline metric is
-    # subject-independent, so every consumer must split by patient, never by
-    # window (the VitalDB case-leakage lesson, same mechanism as PpgData.groups).
-    groups: np.ndarray | None = None
-    # Source record id per window (e.g. "chb01_03"). Finer-grained than
-    # `groups`: used by `eeg_patient_specific_split` to hold out whole
-    # RECORDS (not random windows) within one patient for the patient-
-    # specific diagnostic (docs/eeg_seizure_task.md) — a within-patient
-    # window-random split would leak the same seizure event's neighbouring
-    # windows across train/test.
-    record_ids: np.ndarray | None = None
-    # "raw" (default, delta-encoded waveform, per-window self-normalized —
-    # unchanged legacy behavior) or "features" (docs/eeg_frontend_task.md:
-    # line length / relative band power / spectral entropy per sub-window,
-    # NOT yet normalized — X holds raw feature values). Callers must check
-    # this and run `eeg_features.normalize_features_train_only` on the
-    # "features" case AFTER splitting, never before (train-only fit).
-    frontend: str = "raw"
 
 
 # --------------------------------------------------------------------------- #
@@ -249,6 +245,415 @@ def load_ecg(prefer_real: bool = True, require_real: bool = False,
     if window is not None:
         synth_kwargs["window"] = window
     data = make_synthetic_ecg(**synth_kwargs)
+    data.requested_real = prefer_real
+    return data
+
+
+# --------------------------------------------------------------------------- #
+# Heart sounds (PCG) — synthetic generator
+# --------------------------------------------------------------------------- #
+def _s1s2_beat(n: int, rng: np.random.Generator) -> np.ndarray:
+    """Stylised normal heart-sound cycle: S1 (louder, lower-pitch "lub") then
+    S2 (softer, higher-pitch "dub") with a systolic gap between them and a
+    longer diastolic gap after — the two-beat cadence a listener recognizes
+    as a normal heartbeat.
+    """
+    t = np.linspace(0, 1, n)
+    jitter = rng.normal(0, 0.01)
+    s1 = _gaussian(t, 0.15 + jitter, 0.02, 1.0) * np.sin(2 * np.pi * 12 * t)
+    s2 = _gaussian(t, 0.45 + jitter, 0.015, 0.6) * np.sin(2 * np.pi * 18 * t)
+    return s1 + s2
+
+
+def _murmur_beat(n: int, rng: np.random.Generator) -> np.ndarray:
+    """Stylised abnormal cycle: the same S1/S2 structure, plus a systolic
+    murmur — smoothed (crudely band-limited) noise filling the S1-S2 gap,
+    mimicking turbulent flow through a diseased valve (mitral regurgitation /
+    aortic stenosis — the causes CinC 2016's own documentation names as
+    typical for its abnormal recordings).
+    """
+    beat = _s1s2_beat(n, rng)
+    t = np.linspace(0, 1, n)
+    systolic = ((t > 0.18) & (t < 0.42)).astype(np.float64)
+    raw_noise = rng.normal(0, 1.0, size=n)
+    # Cheap band-limiting: a short moving-average smooths out the highest
+    # frequencies without importing scipy just for synthetic data (matches
+    # the other make_synthetic_* generators' pure-NumPy convention).
+    kernel = np.ones(5) / 5
+    murmur = np.convolve(raw_noise, kernel, mode="same") * systolic * 0.4
+    return beat + murmur
+
+
+def make_synthetic_heart(
+    n_samples: int = 2000,
+    window: int = 128,
+    fs: float = 128.0,
+    abnormal_frac: float = 0.3,
+    noise: float = 0.03,
+    seed: int = 0,
+) -> HeartData:
+    """Generate a balanced-ish synthetic heart-sound (PCG) set: normal
+    S1-S2 "lub-dub" cycles vs. abnormal cycles with an added systolic
+    murmur — a stylised proxy for valve regurgitation/stenosis, not a
+    clinical claim (same spirit as `make_synthetic_ecg`/`make_synthetic_ppg`).
+    """
+    rng = np.random.default_rng(seed)
+    X = np.empty((n_samples, window), dtype=np.float32)
+    y = np.empty((n_samples,), dtype=np.int64)
+    for i in range(n_samples):
+        if rng.random() < abnormal_frac:
+            beat = _murmur_beat(window, rng)
+            y[i] = 1
+        else:
+            beat = _s1s2_beat(window, rng)
+            y[i] = 0
+        beat = beat + rng.normal(0, noise, size=window)
+        X[i] = beat.astype(np.float32)
+    return HeartData(X=X, y=y, fs=fs, source="synthetic")
+
+
+# --------------------------------------------------------------------------- #
+# Heart sounds (PCG) — real PhysioNet/CinC Challenge 2016 via wfdb (optional)
+# --------------------------------------------------------------------------- #
+CINC2016_SETS = ("a", "b", "c", "d", "e", "f")
+CINC2016_NATIVE_FS = 2000.0
+
+# Bands for the "features" front-end (docs/heart_sounds_task.md's escalation
+# path: raw delta-encoding measured ~chance, and a murmur is a spectral/
+# turbulent-flow signature within the 20-400 Hz PCG band, not an edge — see
+# `eia.signal_features`). "low" ~ S1/S2 fundamental energy; "high" ~ where
+# turbulent-flow murmur energy concentrates (mitral regurgitation/aortic
+# stenosis) — the same "two extremes of the band" pattern the EEG front-end
+# used (delta+beta) before it was retired.
+PCG_BANDS = {"low": (20.0, 100.0), "mid": (100.0, 200.0), "high": (200.0, 400.0)}
+PCG_FEATURE_NAMES = ("line_length", "low", "high", "spectral_entropy")
+
+
+def _bandpass_filter(sig: np.ndarray, fs: float, band: tuple) -> np.ndarray:
+    """4th-order Butterworth band-pass, zero-phase (`filtfilt`), along the
+    signal's time axis. Generic (not modality-specific) — heart sounds use
+    ~20-400 Hz (S1/S2 energy is low, murmurs higher).
+    """
+    from scipy.signal import butter, filtfilt
+    b, a = butter(4, band, btype="band", fs=fs)
+    return filtfilt(b, a, sig, axis=0)
+
+
+def _fetch_cinc2016_index(training_set: str, cache_dir: str,
+                           timeout_sec: float = 30.0) -> list:
+    """Fetch `RECORDS`/`REFERENCE.csv`/`REFERENCE-SQI.csv` for one CinC 2016
+    training set (small text files, cached to disk) and return
+    `[(record_name, label, quality), ...]`.
+
+    Confirmed live against the installed data before writing this loader
+    (docs/heart_sounds_task.md Part 0): `REFERENCE.csv` is
+    `record,label` with **label 1 = abnormal, -1 = normal** (cross-checked
+    against the record's own `.hea` comment line, e.g. `# Abnormal`);
+    `REFERENCE-SQI.csv` is `record,label,quality` with quality 0/1 (a
+    signal-quality index — ~4% of training-a is quality=0, skewed heavily
+    toward the abnormal class). `quality` is `None` if a set's
+    `REFERENCE-SQI.csv` can't be fetched (kept, not excluded, since quality
+    is unknown rather than confirmed poor).
+    """
+    import os
+    import urllib.request
+    os.makedirs(cache_dir, exist_ok=True)
+    base = f"https://physionet.org/files/challenge-2016/1.0.0/training-{training_set}"
+
+    def _fetch_text(name):
+        path = os.path.join(cache_dir, f"training-{training_set}-{name}")
+        if not os.path.exists(path):
+            with urllib.request.urlopen(f"{base}/{name}", timeout=timeout_sec) as resp:
+                data = resp.read()
+            with open(path, "wb") as f:
+                f.write(data)
+        with open(path, "r", errors="ignore") as f:
+            return f.read()
+
+    labels = {}
+    for line in _fetch_text("REFERENCE.csv").strip().splitlines():
+        rec, lab = line.split(",")
+        labels[rec] = int(lab)
+
+    quality = {}
+    try:
+        for line in _fetch_text("REFERENCE-SQI.csv").strip().splitlines():
+            parts = line.split(",")
+            quality[parts[0]] = int(parts[2])
+    except Exception:  # noqa: BLE001 — some sets could lack this file; unknown, not excluded
+        pass
+
+    return [(rec, lab, quality.get(rec)) for rec, lab in labels.items()]
+
+
+def _load_cinc2016_record(training_set: str, record: str, cache_dir: str):
+    """Stream one CinC 2016 record's PCG channel via wfdb and cache it.
+
+    Selects the channel named `"PCG"` explicitly rather than assuming a
+    fixed index — training-a's records also carry a simultaneous `"ECG"`
+    reference channel (confirmed live), so index 0 is not reliably the PCG
+    channel across every training set (all others carry PCG only).
+    """
+    import os
+    path = os.path.join(cache_dir, f"training-{training_set}_{record}.npz")
+    if os.path.exists(path):
+        d = np.load(path)
+        return d["sig"], float(d["fs"])
+    import wfdb
+    os.makedirs(cache_dir, exist_ok=True)
+    rec = wfdb.rdrecord(record, pn_dir=f"challenge-2016/1.0.0/training-{training_set}")
+    pcg_idx = rec.sig_name.index("PCG")
+    sig = rec.p_signal[:, pcg_idx].astype(np.float32)
+    fs = float(rec.fs)
+    np.savez(path, sig=sig, fs=fs)
+    return sig, fs
+
+
+def load_cinc2016(
+    training_sets: tuple | None = None,
+    max_records: int | None = 300,
+    window_sec: float = 3.0,
+    resample_to: int | None = 128,
+    band_pass: tuple = (20.0, 400.0),
+    min_quality: int = 1,
+    max_windows_per_record: int = 20,
+    cache_dir: str = "data/cinc2016",
+    seed: int = 0,
+    verbose: bool = True,
+    record_timeout_sec: float = 60.0,
+    retries: int = 1,
+    heart_frontend: str = "features",
+    n_subwindows: int = 24,
+    feature_names: tuple | None = None,
+) -> HeartData:
+    """Stream PhysioNet/CinC Challenge 2016 heart-sound (PCG) recordings,
+    windowed and labelled normal/abnormal.
+
+    Part 0 findings (docs/heart_sounds_task.md — verified against the live
+    dataset before writing this loader, not assumed):
+    - WFDB-native (`.hea`/`.dat`, also `.wav`), streams directly via
+      `wfdb.rdrecord(record, pn_dir="challenge-2016/1.0.0/training-<set>")`
+      — no format conversion needed (unlike CHB-MIT's EDF).
+    - Native fs = 2000 Hz, confirmed live (`CINC2016_NATIVE_FS`).
+    - 6 training sets (a-f), 3240 recordings total, 665 abnormal / 2575
+      normal (~20.5% abnormal) — imbalanced, but far milder than CHB-MIT's
+      seizure prevalence; the existing class-weighted-CE + balanced-accuracy
+      machinery is applied from the start regardless.
+    - **Subject ids are NOT recoverable.** CinC 2016's own documentation
+      states a subject may contribute 1-6 recordings, but no subject-id
+      field exists in any distributed file (`RECORDS`, `REFERENCE.csv`,
+      `REFERENCE-SQI.csv`, or the `.hea` header) — confirmed by direct
+      inspection, not assumed. `HeartData.groups` is therefore always
+      `None` for this loader; the split is by RECORDING, documented here
+      and in the data card, matching common practice in published CinC
+      2016 work (patient ids are withheld from the public release).
+    - Recordings vary from ~5s to ~120s (documented range) — segmented
+      into fixed `window_sec` windows here, capped per recording via
+      `max_windows_per_record` so long recordings don't dominate.
+
+    Args:
+        training_sets: which of `CINC2016_SETS` ("a".."f") to pull from
+            (default all six).
+        max_records: cap on how many recordings (across all requested sets)
+            to actually pull, a seeded random subset of the qualifying pool
+            — keeps a default run fast; increase for a fuller result.
+        window_sec: physiological capture duration per window, at native
+            2000 Hz (a duration, not a Xylo timestep budget — see
+            `resample_to`, same decoupling as `load_mitbih`).
+        resample_to: `heart_frontend="raw"` only. FFT-resample each window
+            from `window_sec * 2000` native samples down to this many Xylo
+            timesteps. **Measured to break the signal, not just cost
+            fidelity**: at the defaults (window_sec=3.0, resample_to=128)
+            the effective rate is 2000*(128/6000) = ~42.7 Hz, a Nyquist of
+            ~21 Hz — below where heart sounds live (S1/S2 ~20-150 Hz,
+            murmurs up to ~400+ Hz), so the raw-waveform path band-limits
+            away the diagnostic content before the SNN ever sees it (float
+            balanced acc measured ~0.50, flat chance — see
+            docs/heart_sounds_results.md). This is *why* `heart_frontend`
+            defaults to `"features"` instead: `"features"` computes
+            band-power at/near the NATIVE 2000 Hz per sub-window, so the
+            aggressive rate reduction happens AFTER the spectral content is
+            captured, not before.
+        band_pass: PCG-band Butterworth cutoffs in Hz (~20-400 Hz: S1/S2
+            energy is low, murmurs extend higher).
+        min_quality: exclude recordings with a `REFERENCE-SQI.csv` quality
+            flag below this (default 1 = exclude the ~4% flagged poor-
+            quality; a documented Part-0 choice, not a silent default).
+        max_windows_per_record: cap on windows kept per recording (a 120s
+            recording at window_sec=3 gives 40 windows; capping keeps one
+            long recording from dominating the dataset).
+        cache_dir: per-recording cache (gitignored `data/`).
+        seed: controls the random `max_records` subsample and any
+            downstream window subsampling.
+        verbose: print the pull plan and per-recording progress.
+        record_timeout_sec: wall-clock cap on each index fetch / record
+            read (`_call_with_timeout`, a daemon-thread timeout — same
+            resumable/watchable pattern used for CHB-MIT). A timed-out or
+            failing recording is skipped, never a hang.
+        retries: extra attempts (beyond the first) before giving up.
+        heart_frontend: `"features"` (default) or `"raw"` — see the
+            `resample_to` note above for why raw-waveform delta-encoding at
+            a downsampled rate measured ~chance. `"features"` extracts line
+            length / relative band power (`PCG_BANDS`) / spectral entropy
+            per sub-window at/near native 2000 Hz (`eia.signal_features`),
+            ignores `resample_to` (`n_subwindows` sets the timestep count
+            instead), and returns X NOT yet normalized — callers must run
+            `signal_features.normalize_features_train_only` after splitting.
+            `"raw"` is kept selectable for A/B (`--heart-frontend raw` on
+            `scripts/xylo_verify.py`), not removed.
+        n_subwindows: only used when `heart_frontend="features"` — number of
+            equal sub-windows per capture window (each becomes one Xylo
+            timestep).
+        feature_names: only used when `heart_frontend="features"` — default
+            `PCG_FEATURE_NAMES` if None.
+
+    Returns:
+        HeartData with `source="cinc2016"`, `groups=None` (see above).
+    """
+    try:
+        import wfdb  # noqa: F401  (import check; actual reads use wfdb.rdrecord)
+    except ImportError as e:  # pragma: no cover
+        raise ImportError("Install the data extra: pip install 'eia[data]'") from e
+
+    import time
+
+    if heart_frontend not in ("raw", "features"):
+        raise ValueError(f"heart_frontend must be 'raw' or 'features', got {heart_frontend!r}")
+    if heart_frontend == "features" and feature_names is None:
+        feature_names = PCG_FEATURE_NAMES
+
+    training_sets = training_sets or CINC2016_SETS
+    rng = np.random.default_rng(seed)
+    window_native = int(round(window_sec * CINC2016_NATIVE_FS))
+
+    # Phase 1: fetch each set's index (small text files) and build the full
+    # pull plan up front, filtered by quality.
+    pool = []  # [(training_set, record, label01), ...]
+    for ts in training_sets:
+        entries, err = _call_with_timeout(
+            _fetch_cinc2016_index, record_timeout_sec, retries, ts, cache_dir)
+        if err is not None:
+            print(f"[warn] cinc2016 training-{ts}: failed to fetch index ({err}); skipping set.")
+            continue
+        for rec, lab, qual in entries:
+            if qual is not None and qual < min_quality:
+                continue
+            pool.append((ts, rec, 1 if lab == 1 else 0))
+
+    if not pool:
+        raise RuntimeError("No CinC 2016 records found (index fetch failed for every training set).")
+
+    if max_records is not None and max_records < len(pool):
+        chosen = rng.choice(len(pool), size=max_records, replace=False)
+        pool = [pool[i] for i in sorted(chosen.tolist())]
+
+    n_abn = sum(1 for _, _, lab in pool if lab == 1)
+    if verbose:
+        print(f"[cinc2016] plan: {len(pool)} recordings "
+              f"({n_abn} abnormal, {len(pool) - n_abn} normal), cache_dir={cache_dir!r}")
+
+    # Phase 2: load + window each planned recording.
+    X_list, y_list = [], []
+    for i, (ts, record, label) in enumerate(pool, 1):
+        if verbose:
+            print(f"[cinc2016] training-{ts}/{record} ({i}/{len(pool)})")
+        t0 = time.time()
+        loaded, err = _call_with_timeout(
+            _load_cinc2016_record, record_timeout_sec, retries, ts, record, cache_dir)
+        elapsed = time.time() - t0
+        if err is not None:
+            print(f"[warn] cinc2016 training-{ts}/{record}: failed to load "
+                  f"({err}) after {elapsed:.0f}s; skipping record.")
+            continue
+        sig, fs = loaded
+        if not np.isfinite(sig).all():
+            # A real, confirmed data-quality issue (not guessed): a handful
+            # of CinC 2016 recordings (e.g. a0018, a0204) have NaN samples in
+            # their raw signal that REFERENCE-SQI.csv's quality flag does
+            # NOT catch -- filtfilt propagates a single NaN sample across the
+            # WHOLE filtered signal, silently poisoning every window from
+            # that recording. Skip the recording rather than train on it.
+            if verbose:
+                print(f"[cinc2016]   non-finite raw signal; skipping record.")
+            continue
+
+        filtered = _bandpass_filter(sig, fs, band_pass)
+        n_windows = filtered.shape[0] // window_native
+        if n_windows == 0:
+            if verbose:
+                print(f"[cinc2016]   shorter than one {window_sec}s window; skipping.")
+            continue
+        win_idx = list(range(n_windows))
+        if len(win_idx) > max_windows_per_record:
+            win_idx = sorted(rng.choice(win_idx, size=max_windows_per_record, replace=False).tolist())
+        for w in win_idx:
+            seg = filtered[w * window_native:(w + 1) * window_native]
+            if heart_frontend == "features":
+                from eia import signal_features
+                feat = signal_features.extract_window_features(
+                    seg[None, :], fs, n_subwindows, feature_names, PCG_BANDS)
+                X_list.append(feat.astype(np.float32))  # (n_features, n_subwindows)
+            else:
+                X_list.append(seg.astype(np.float32))
+            y_list.append(label)
+
+        if verbose:
+            print(f"[cinc2016]   loaded in {elapsed:.1f}s -- "
+                  f"{len(win_idx)} windows this recording, {len(X_list)} cumulative")
+
+    if not X_list:
+        raise RuntimeError("No PCG windows extracted from CinC 2016.")
+
+    X = np.stack(X_list)  # (n, window_native) raw, or (n, n_features, n_subwindows) features
+    if heart_frontend == "features":
+        # fs of the TIMESTEP axis (sub-windows), not the native PCG rate --
+        # matches report.data_card's generic `duration_s = window / fs`.
+        fs_eff = n_subwindows / window_sec
+        # Deliberately NOT normalized here -- z-score stats must be fit on
+        # the TRAIN split only (signal_features.normalize_features_train_only),
+        # and this function doesn't know the split.
+    else:
+        fs_eff = CINC2016_NATIVE_FS
+        if resample_to is not None and resample_to != window_native:
+            X = resample_windows(X, resample_to)
+            fs_eff = CINC2016_NATIVE_FS * (resample_to / window_native)
+        X = (X - X.mean(axis=1, keepdims=True)) / (X.std(axis=1, keepdims=True) + 1e-8)
+
+    return HeartData(X=X.astype(np.float32), y=np.array(y_list, dtype=np.int64),
+                      fs=fs_eff, source="cinc2016", groups=None, frontend=heart_frontend)
+
+
+def load_heart(prefer_real: bool = True, require_real: bool = False,
+               **kwargs) -> HeartData:
+    """Load heart-sound data, preferring real CinC 2016 but falling back to
+    synthetic. Mirrors `load_ecg`'s provenance contract exactly.
+
+    Args:
+        prefer_real: try `load_cinc2016()` first.
+        require_real: if real data was requested and fails to load, raise
+            instead of silently substituting synthetic. Every allowed
+            fallback still prints a `[warn]` line naming the reason.
+        **kwargs: forwarded to `load_cinc2016` (training_sets, max_records,
+            window_sec, resample_to, band_pass, min_quality,
+            max_windows_per_record, cache_dir, seed) when real; ignored
+            when falling back to synthetic.
+    """
+    if require_real and not prefer_real:
+        raise ValueError("require_real=True has no effect with prefer_real=False "
+                          "(nothing was asked to be real).")
+    if prefer_real:
+        try:
+            data = load_cinc2016(**kwargs)
+            data.requested_real = True
+            return data
+        except Exception as e:  # noqa: BLE001  — any failure -> synthetic (or raise)
+            if require_real:
+                raise RuntimeError(
+                    f"--require-real: real CinC 2016 heart sounds failed to load ({e}); "
+                    "refusing to silently substitute synthetic heart sounds."
+                ) from e
+            print(f"[warn] real CinC 2016 unavailable ({e}); falling back to synthetic heart sounds.")
+    data = make_synthetic_heart()
     data.requested_real = prefer_real
     return data
 
@@ -572,126 +977,19 @@ def load_ppg_vitaldb(prefer_real: bool = True, require_real: bool = False,
 
 
 # --------------------------------------------------------------------------- #
-# EEG — real CHB-MIT seizure detection (MARCH "H", Phase 1)
+# Generic loader helpers (resampling + network timeout/retry) — originally
+# added for EEG's CHB-MIT loader, kept because the heart-sound CinC 2016
+# loader (`load_cinc2016`) also depends on both. Not modality-specific.
 # --------------------------------------------------------------------------- #
-# Fixed bipolar montage (10-20 "double banana"), applied identically to every
-# subject — NOT patient-specific channel selection, since a field device has
-# never seen this patient (docs/eeg_seizure_task.md Flag 2). 6 channels ->
-# 12 spike channels after ON/OFF delta encoding, leaving margin under Xylo's
-# 16-input-channel ceiling (8ch would sit exactly at the limit with zero
-# headroom). Left/right frontotemporal pairs (common seizure-focus region)
-# plus the midline central-parietal pair, verified present in every
-# successfully-read CHB-MIT header checked (chb01, chb02, chb03, chb05,
-# chb08, chb24 — see docs/eeg_seizure_task.md Part 0).
-EEG_MONTAGE = ["FP1-F7", "F7-T7", "FP2-F8", "F8-T8", "FZ-CZ", "CZ-PZ"]
-
-# Channel subset for the FEATURE front-end (docs/eeg_frontend_task.md):
-# left+right temporal (a common seizure-focus region, matching the reasoning
-# behind EEG_MONTAGE itself), trimmed to 2 of the 6 EEG_MONTAGE channels so
-# `len(FEATURE_NAMES) * len(FEATURE_MONTAGE) * 2` (features x channels, x2
-# for the existing ON/OFF delta encoder every other modality already uses)
-# lands exactly on Xylo's 16-input ceiling: 4 features x 2 channels x 2 = 16.
-# See docs/eeg_frontend_results.md for the full input-count accounting
-# (including why this is stricter than the task doc's illustrative "4ch x
-# 4 features = 16" arithmetic, which didn't account for the ON/OFF doubling).
-FEATURE_MONTAGE = ["F7-T7", "F8-T8"]
-
-EEG_NATIVE_FS = 256.0  # CHB-MIT's fixed sampling rate, confirmed via wfdb
-
-# chb21 is the SAME PATIENT as chb01 (a second recording session) — CHB-MIT's
-# own documentation states this. Canonicalizing prevents one patient's
-# windows from landing in both train and test under two different ids.
-_EEG_PATIENT_ALIASES = {"chb21": "chb01"}
-
-# Subjects with confirmed-readable headers (verified via a header_only probe
-# against every subject's first record before writing this default list).
-# chb12, chb13, chb14, chb16, chb17, chb18, chb19, chb21 all raise a "math
-# domain error" from wfdb's EDF parser on their very first record — a real,
-# reproducible limitation of `wfdb.io.convert.edf.read_edf` on those specific
-# files, not guessed and not per-record flakiness. `load_chbmit` also skips
-# any subject/record it can't read at load time and prints why, so passing
-# an unreadable subject here is harmless (0 windows from it).
-# chb20, chb22, chb23, chb24 are ALSO confirmed-readable but excluded from
-# this default purely for download time (each subject costs ~2-3 records x
-# ~40MB streamed through wfdb's EDF reader, observed at several minutes per
-# record) — pass them explicitly via `subjects=` if you want a larger pool.
-DEFAULT_EEG_SUBJECTS = ["chb01", "chb02", "chb03", "chb05", "chb06", "chb07",
-                         "chb08", "chb09", "chb10"]
-
-
-def eeg_canonical_patient(subject: str) -> str:
-    """Map a CHB-MIT subject id to its canonical patient id (chb21 -> chb01,
-    the one documented same-patient alias in this dataset). Pure function so
-    the group-merging logic is unit-testable without any network access."""
-    return _EEG_PATIENT_ALIASES.get(subject, subject)
-
-
-def select_montage(sig: np.ndarray, sig_name: list, montage: list) -> np.ndarray:
-    """Select and reorder fixed montage channels from a (n_samples, n_sig)
-    array using the record's own channel-name list. Raises (does not
-    silently substitute a different channel) if any montage channel is
-    missing — the caller should catch this and skip the record, mirroring
-    VitalDB's "skip cases missing a required track" pattern.
-    """
-    missing = [ch for ch in montage if ch not in sig_name]
-    if missing:
-        raise ValueError(f"missing montage channel(s): {missing}")
-    idx = [sig_name.index(ch) for ch in montage]
-    return sig[:, idx]
-
-
-def bandpass_eeg(sig: np.ndarray, fs: float, band: tuple = (0.5, 25.0)) -> np.ndarray:
-    """4th-order Butterworth band-pass, zero-phase (`filtfilt`), along axis 0
-    (time), applied to every channel. Restricts to the seizure-relevant band
-    BEFORE resampling to a short Xylo timestep budget — the point being that
-    256 Hz full-bandwidth resolution isn't needed once the signal is band-
-    limited to ~25 Hz, so a much shorter timestep count still holds the
-    seizure signature (docs/eeg_seizure_task.md's timestep-count lesson,
-    same mechanism as `docs/ecg_quant_diagnosis.md`'s root cause: on-chip
-    fidelity degrades with timestep count, not weight bits).
-    """
-    from scipy.signal import butter, filtfilt
-    b, a = butter(4, band, btype="band", fs=fs)
-    return filtfilt(b, a, sig, axis=0)
-
-
 def resample_windows(X: np.ndarray, resample_to: int) -> np.ndarray:
     """FFT-resample the last axis (time) of a 2-D (n, window) or 3-D
     (n, channels, window) array to `resample_to` samples — the
     `load_mitbih`-style decoupling of "how much signal is captured" from
-    "how many Xylo timesteps it costs." Generic over ndim so it serves both
-    the single-channel ECG/PPG path and EEG's multi-channel one.
+    "how many Xylo timesteps it costs." Generic over ndim so it serves any
+    single-channel (ECG/PPG/heart) or multi-channel modality alike.
     """
     from scipy.signal import resample as _fft_resample
     return _fft_resample(X, resample_to, axis=-1)
-
-
-def parse_chbmit_summary(text: str) -> dict:
-    """Parse a CHB-MIT `chbXX-summary.txt` into {record_name: [(start, end), ...]}
-    (seizure intervals in seconds since the record started; empty list = no
-    seizures in that record). Handles both the singular format used when a
-    record has exactly one seizure (`Seizure Start Time:`) and the numbered
-    format used for 2+ (`Seizure 2 Start Time:`) — confirmed against live
-    files for both cases before writing this (docs/eeg_seizure_task.md Part 0).
-    Pure function, no network — unit-testable on a small literal string.
-    """
-    import re
-    records: dict = {}
-    for block in text.split("File Name: ")[1:]:
-        lines = block.splitlines()
-        fname = lines[0].strip()
-        rec = fname[:-4] if fname.endswith(".edf") else fname
-        starts = [int(m) for m in re.findall(
-            r"Seizure(?:\s+\d+)?\s+Start Time:\s*(\d+)\s*seconds", block)]
-        ends = [int(m) for m in re.findall(
-            r"Seizure(?:\s+\d+)?\s+End Time:\s*(\d+)\s*seconds", block)]
-        records[rec] = list(zip(starts, ends))
-    return records
-
-
-def _label_seizure_window(t0: float, t1: float, seizures: list) -> int:
-    """1 if window [t0, t1) (seconds) overlaps any seizure interval."""
-    return int(any(t0 < e and t1 > s for s, e in seizures))
 
 
 def _call_with_timeout(fn, timeout_sec: float, retries: int = 0, *args, **kwargs):
@@ -699,8 +997,7 @@ def _call_with_timeout(fn, timeout_sec: float, retries: int = 0, *args, **kwargs
     timeout, retrying up to `retries` times on timeout or exception. Returns
     `(result, None)` on success, `(None, error)` if every attempt failed —
     never raises, so callers can skip-and-continue uniformly (mirrors the
-    existing "skip records/subjects that fail to load" behavior in
-    `load_chbmit`).
+    "skip records that fail to load" behavior in `load_cinc2016`).
 
     A thread, not `signal.alarm`: works the same on Colab (Linux) and
     locally (macOS/Windows), and lets tests exercise it directly with a
@@ -735,457 +1032,3 @@ def _call_with_timeout(fn, timeout_sec: float, retries: int = 0, *args, **kwargs
         return outcome.get("value"), None
     return None, last_err
 
-
-def _fetch_chbmit_summary(subject: str, cache_dir: str, timeout_sec: float = 30.0) -> dict:
-    import os
-    import urllib.request
-    os.makedirs(cache_dir, exist_ok=True)
-    path = os.path.join(cache_dir, f"{subject}-summary.txt")
-    if not os.path.exists(path):
-        url = f"https://physionet.org/files/chbmit/1.0.0/{subject}/{subject}-summary.txt"
-        # urlretrieve has no timeout knob; urlopen does — a stalled connect
-        # or read on this small text file shouldn't be able to hang forever
-        # any more than the big EDF pulls below can.
-        with urllib.request.urlopen(url, timeout=timeout_sec) as resp:
-            data = resp.read()
-        with open(path, "wb") as f:
-            f.write(data)
-    with open(path, "r", errors="ignore") as f:
-        text = f.read()
-    return parse_chbmit_summary(text)
-
-
-def _montage_cache_tag(montage: list) -> str:
-    """Filename-safe signature distinguishing WHICH channel montage a cached
-    record's array holds. The raw (`EEG_MONTAGE`, 6ch) and feature
-    (`FEATURE_MONTAGE`, 2ch) front-ends select DIFFERENT channels from the
-    same subject/record, so the cache key must depend on the montage, not
-    just subject+record — otherwise a cache hit could silently hand back the
-    wrong channels (e.g. all 6 raw channels when the feature front-end asked
-    for exactly 2). Empty for the default `EEG_MONTAGE` so files already
-    cached before this distinction existed still hit — no forced re-download.
-    """
-    if list(montage) == EEG_MONTAGE:
-        return ""
-    return "_" + "-".join(ch.replace("-", "") for ch in montage)
-
-
-def _load_chbmit_record_montage(subject: str, record: str, montage: list,
-                                 cache_dir: str):
-    """Stream one CHB-MIT record's EDF via wfdb, select the fixed montage,
-    and cache the (much smaller) montage-only array to disk — repeat runs
-    (e.g. a --resample-to sweep) don't need to re-download the full
-    23-channel, ~42 MB-per-hour EDF every time.
-    """
-    import os
-    tag = _montage_cache_tag(montage)
-    path = os.path.join(cache_dir, f"{subject}_{record}_montage{tag}.npz")
-    if os.path.exists(path):
-        d = np.load(path)
-        return d["sig"], float(d["fs"])
-
-    # If every requested channel is already present in the default
-    # EEG_MONTAGE's cache (true for FEATURE_MONTAGE, a subset of it), derive
-    # this montage from that instead of re-downloading the EDF — this is
-    # exactly what lets the feature front-end reuse the already-cached raw
-    # 4-patient pool with zero new network access.
-    default_path = os.path.join(cache_dir, f"{subject}_{record}_montage.npz")
-    if tag and os.path.exists(default_path) and all(ch in EEG_MONTAGE for ch in montage):
-        d = np.load(default_path)
-        idx = [EEG_MONTAGE.index(ch) for ch in montage]
-        sig, fs = d["sig"][:, idx], float(d["fs"])
-        os.makedirs(cache_dir, exist_ok=True)
-        np.savez(path, sig=sig, fs=fs)  # cache the derived subset too
-        return sig, fs
-
-    from wfdb.io.convert.edf import read_edf
-    os.makedirs(cache_dir, exist_ok=True)
-    h = read_edf(record + ".edf", pn_dir=f"chbmit/{subject}")
-    sig = select_montage(h.p_signal.astype(np.float32), h.sig_name, montage)
-    fs = float(h.fs)
-    np.savez(path, sig=sig, fs=fs)
-    return sig, fs
-
-
-def load_chbmit(
-    subjects: list | None = None,
-    seizure_records_per_subject: int = 2,
-    nonseizure_records_per_subject: int = 1,
-    window_sec: float = 4.0,
-    resample_to: int | None = 128,
-    montage: list | None = None,
-    band_pass: tuple = (0.5, 25.0),
-    neg_per_record: int = 60,
-    cache_dir: str = "data/chbmit",
-    seed: int = 0,
-    verbose: bool = True,
-    record_timeout_sec: float = 300.0,
-    retries: int = 1,
-    eeg_frontend: str = "raw",
-    n_subwindows: int = 8,
-    feature_names: tuple | None = None,
-) -> EegData:
-    """Stream CHB-MIT scalp EEG, windowed and labelled for seizure detection.
-
-    Two selectable front-ends (`eeg_frontend`, docs/eeg_frontend_task.md):
-
-    - `"raw"` (default, unchanged from before): 23 native channels -> fixed
-      6-channel bipolar montage (`EEG_MONTAGE`) -> band-pass to the seizure
-      band -> per-window self z-score -> FFT-resample to `resample_to` Xylo
-      timesteps -> delta-encoded downstream. Captures *edges*; the diagnosis
-      in docs/eeg_seizure_results.md found this starves the float model
-      (~chance on both subject-independent and patient-specific splits).
-    - `"features"`: the redesign. Same montage-select + band-pass, but each
-      window is split into `n_subwindows` sub-windows (the SNN's timesteps)
-      and reduced to physiologically-grounded features per channel — line
-      length, relative band power, spectral entropy (`eia.eeg_features`) —
-      captures *sustained rhythmic evolution* instead of edges. Uses the
-      smaller `FEATURE_MONTAGE` (not `EEG_MONTAGE`) by default to keep
-      features x channels x 2 (existing ON/OFF delta doubling) within
-      Xylo's 16-input ceiling. Returned `EegData.X` holds RAW
-      (un-normalized) feature values — normalization must be fit on the
-      TRAIN split only (`eeg_features.normalize_features_train_only`),
-      never inside this function, which doesn't know the split.
-
-    Requires `wfdb` (`pip install 'eia[data]'`) and network.
-
-    Resumable and watchable (each ~40MB EDF pull used to be silent and
-    unbounded, so a big subject list just looked hung for hours, and one
-    stalled PhysioNet connection could hang the whole call forever):
-    prints the full download plan (total/cached/to-download) up front, then
-    per-record progress with elapsed time and a running window count, and
-    wraps every network call (the summary fetch AND each record's EDF read)
-    in a wall-clock timeout with an optional retry — a stuck record is
-    skipped, exactly like a record that fails to load for any other reason,
-    never a hang. Already-cached records (see `_load_chbmit_record_montage`)
-    are instant and reported as cache hits, so resuming an interrupted pull
-    (e.g. after a Colab runtime reset, if `cache_dir` persists — see
-    `notebooks/02_eeg_seizure.ipynb`'s optional Drive-mount cell) only pays
-    for what's still missing.
-
-    Args:
-        subjects: CHB-MIT subject ids to pull from (default
-            `DEFAULT_EEG_SUBJECTS`). chb21 is automatically folded into
-            chb01's patient group if included (`eeg_canonical_patient`).
-        seizure_records_per_subject: up to this many of the subject's
-            seizure-containing records are used (ALL seizure windows from a
-            chosen record are kept; see `neg_per_record` for negatives).
-        nonseizure_records_per_subject: up to this many records with zero
-            seizures, for non-ictal background diversity.
-        window_sec: physiological capture duration per window, at native
-            256 Hz (a duration, not a Xylo timestep budget — see
-            `resample_to`, same decoupling as `datasets.load_mitbih`).
-        resample_to: FFT-resample each window from `window_sec * 256` native
-            samples down to this many Xylo timesteps; None keeps native.
-            Ignored when `eeg_frontend="features"` (`n_subwindows` sets the
-            timestep count there instead).
-        montage: override the channel list. Default is `eeg_frontend`-
-            dependent: `EEG_MONTAGE` (6ch) for `"raw"`, `FEATURE_MONTAGE`
-            (2ch) for `"features"`.
-        band_pass: seizure-band Butterworth cutoffs in Hz.
-        neg_per_record: cap on non-seizure windows kept per record (a 1-hour
-            record has ~900 windows at window_sec=4; keeping all of them
-            would swamp the rare seizure windows and balloon dataset size).
-            ALL seizure windows in a chosen record are always kept.
-        cache_dir: per-record montage cache (gitignored `data/`).
-        seed: controls which negative windows are subsampled per record.
-        verbose: print the download plan and per-record progress (elapsed
-            time, cache-hit/download, running window count). `[warn]` lines
-            for skipped subjects/records always print regardless of this —
-            provenance/failures are never silent, matching every other
-            loader's `require_real`/fallback convention in this module.
-        record_timeout_sec: wall-clock cap on each summary fetch and each
-            record's EDF read (via `_call_with_timeout`, a daemon-thread
-            timeout — portable across Colab/local, no `signal.alarm`). A
-            record that times out is skipped, same as one that raises.
-        retries: extra attempts (beyond the first) per summary fetch / EDF
-            read before giving up and skipping.
-        eeg_frontend: `"raw"` (default) or `"features"` — see above.
-        n_subwindows: `"features"` only — split each `window_sec` window
-            into this many equal sub-windows (the SNN's timesteps); each
-            must be long enough for a usable Welch PSD estimate (default 8
-            -> 0.5s / 128 samples at native 256 Hz).
-        feature_names: `"features"` only — override which features are
-            computed (default `eeg_features.FEATURE_NAMES`; any subset of
-            `("line_length", "delta", "theta", "alpha", "beta",
-            "spectral_entropy")`, mind the input-budget math in
-            `FEATURE_MONTAGE`'s docstring if you widen this).
-
-    Returns:
-        EegData with `source="chbmit"`, `groups` = canonical patient id per
-        window (subject-independent split key).
-    """
-    try:
-        import wfdb  # noqa: F401  (import check; actual reads use wfdb.io.convert.edf)
-    except ImportError as e:  # pragma: no cover
-        raise ImportError("Install the data extra: pip install 'eia[data]'") from e
-
-    import os
-    import time
-
-    if eeg_frontend not in ("raw", "features"):
-        raise ValueError(f"eeg_frontend must be 'raw' or 'features', got {eeg_frontend!r}")
-
-    subjects = subjects or DEFAULT_EEG_SUBJECTS
-    if montage is None:
-        montage = FEATURE_MONTAGE if eeg_frontend == "features" else EEG_MONTAGE
-    if eeg_frontend == "features" and feature_names is None:
-        from eia import eeg_features
-        feature_names = eeg_features.FEATURE_NAMES
-    rng = np.random.default_rng(seed)
-    window_native = int(round(window_sec * EEG_NATIVE_FS))
-    _tag = _montage_cache_tag(montage)
-
-    def _cache_path(subject, record):
-        return os.path.join(cache_dir, f"{subject}_{record}_montage{_tag}.npz")
-
-    def _is_cached(subject, record):
-        # A hit either at this montage's own cache path, or derivable
-        # without a download from the default EEG_MONTAGE cache (see
-        # _load_chbmit_record_montage) -- matches what will actually avoid
-        # a network call, so the printed plan isn't misleadingly pessimistic.
-        if os.path.exists(_cache_path(subject, record)):
-            return True
-        if _tag and all(ch in EEG_MONTAGE for ch in montage):
-            return os.path.exists(os.path.join(cache_dir, f"{subject}_{record}_montage.npz"))
-        return False
-
-    # Phase 1: fetch each subject's summary (small text file) and enumerate
-    # the records to pull, so the FULL plan — including cache-hit/miss for
-    # every record — can be printed before any ~40MB EDF download starts.
-    summaries: dict = {}
-    plan: list = []  # [(subject, record), ...]
-    for subject in subjects:
-        summary, err = _call_with_timeout(
-            _fetch_chbmit_summary, record_timeout_sec, retries, subject, cache_dir)
-        if err is not None:
-            print(f"[warn] chbmit {subject}: failed to fetch summary ({err}); skipping subject.")
-            continue
-        summaries[subject] = summary
-        seizure_recs = sorted(r for r, sz in summary.items() if sz)[:seizure_records_per_subject]
-        nonseizure_recs = sorted(
-            r for r, sz in summary.items() if not sz)[:nonseizure_records_per_subject]
-        plan.extend((subject, record) for record in seizure_recs + nonseizure_recs)
-
-    n_cached = sum(1 for s, r in plan if _is_cached(s, r))
-    if verbose:
-        print(f"[chbmit] plan: {len(plan)} records total "
-              f"({n_cached} cached, {len(plan) - n_cached} to download, "
-              f"eeg_frontend={eeg_frontend!r}, cache_dir={cache_dir!r})")
-
-    # Phase 2: load each planned record — cache hits are near-instant, a
-    # download is the ~40MB/record cost the plan above just quantified.
-    X_list, y_list, group_list, record_list = [], [], [], []
-    for i, (subject, record) in enumerate(plan, 1):
-        cache_hit = _is_cached(subject, record)
-        if verbose:
-            print(f"[chbmit] {subject}/{record} ({i}/{len(plan)}) "
-                  f"{'cache hit' if cache_hit else 'downloading...'}")
-
-        t0 = time.time()
-        loaded, err = _call_with_timeout(
-            _load_chbmit_record_montage, record_timeout_sec, retries,
-            subject, record, montage, cache_dir)
-        elapsed = time.time() - t0
-        if err is not None:
-            print(f"[warn] chbmit {subject}/{record}: failed to load "
-                  f"({err}) after {elapsed:.0f}s; skipping record.")
-            continue
-        sig, fs = loaded
-
-        filtered = bandpass_eeg(sig, fs, band_pass)
-        n_windows = filtered.shape[0] // window_native
-        seizures = summaries[subject].get(record, [])
-
-        pos_w, neg_w = [], []
-        for w in range(n_windows):
-            tw0, tw1 = w * window_native / fs, (w + 1) * window_native / fs
-            (pos_w if _label_seizure_window(tw0, tw1, seizures) else neg_w).append(w)
-        if len(neg_w) > neg_per_record:
-            neg_w = list(rng.choice(neg_w, size=neg_per_record, replace=False))
-
-        patient = eeg_canonical_patient(subject)
-        for w in pos_w + neg_w:
-            seg = filtered[w * window_native:(w + 1) * window_native, :].T  # (n_ch, window)
-            if eeg_frontend == "features":
-                from eia import eeg_features
-                feat = eeg_features.extract_window_features(
-                    seg, fs, n_subwindows, feature_names)  # (features*n_ch, n_subwindows)
-                X_list.append(feat.astype(np.float32))
-            else:
-                X_list.append(seg.astype(np.float32))
-            y_list.append(1 if w in pos_w else 0)
-            group_list.append(patient)
-            record_list.append(record)
-
-        if verbose:
-            n_this_record = len(pos_w) + len(neg_w)
-            verb = "loaded" if cache_hit else "downloaded"
-            print(f"[chbmit]   {verb} in {elapsed:.1f}s -- "
-                  f"{n_this_record} windows this record, {len(X_list)} cumulative")
-
-    if not X_list:
-        raise RuntimeError("No EEG windows extracted from CHB-MIT.")
-
-    X = np.stack(X_list)  # (n, C, T) -- (n_ch, window_native) raw, or
-                           # (features*n_ch, n_subwindows) features
-    if eeg_frontend == "features":
-        # fs of the TIMESTEP axis (sub-windows), not the native EEG rate --
-        # matches report.data_card's generic `duration_s = window / fs`.
-        fs_eff = n_subwindows / window_sec
-        # Deliberately NOT normalized here -- z-score stats must be fit on
-        # the TRAIN split only (eeg_features.normalize_features_train_only),
-        # and this function doesn't know the split. Leaving X as raw feature
-        # values is the guard against silently leaking val/test into the fit.
-    else:
-        fs_eff = EEG_NATIVE_FS
-        if resample_to is not None and resample_to != window_native:
-            X = resample_windows(X, resample_to)
-            fs_eff = EEG_NATIVE_FS * (resample_to / window_native)
-        X = (X - X.mean(axis=-1, keepdims=True)) / (X.std(axis=-1, keepdims=True) + 1e-8)
-
-    return EegData(X=X.astype(np.float32), y=np.array(y_list, dtype=np.int64),
-                    fs=fs_eff, source="chbmit",
-                    groups=np.array(group_list, dtype="<U8"),
-                    record_ids=np.array(record_list, dtype="<U16"),
-                    frontend=eeg_frontend)
-
-
-def eeg_patient_specific_split(data: "EegData", patient: str, seed: int,
-                                test_frac: float = 0.3, val_frac: float = 0.2):
-    """Within-patient train/val/test split for the patient-specific EEG
-    diagnostic (docs/eeg_seizure_task.md follow-up: disambiguating "too
-    little cross-patient data" from "the front-end destroyed the seizure
-    signal"). Holds out whole RECORDS for test — never individual windows —
-    so a seizure event's neighbouring windows can't straddle train/test (the
-    within-patient analogue of the case/patient-level leakage guard used
-    everywhere else in this repo). `val` is carved window-level from the
-    training records only, for checkpoint selection — that's fine because it
-    is never the reported metric, only the record-disjoint test set is.
-
-    Returns the same 9-tuple shape as `case_level.split_data`
-    (Xtr, Xval, Xte, ytr, yval, yte, groups_tr, groups_val, groups_te), or
-    `None` if this patient can't support a class-balanced record split:
-    fewer than 2 distinct records, or no permutation of records (tried up to
-    10 times) puts both classes in both the train and test halves.
-    """
-    if data.record_ids is None or data.groups is None:
-        raise ValueError("eeg_patient_specific_split needs data.record_ids and data.groups")
-
-    mask = data.groups == patient
-    idx_all = np.where(mask)[0]
-    if idx_all.size == 0:
-        return None
-    rec = data.record_ids[idx_all]
-    y = data.y[idx_all]
-    unique_records = np.unique(rec)
-    if unique_records.size < 2:
-        return None
-
-    rng = np.random.default_rng(seed)
-    te_mask = tr_mask = None
-    for _attempt in range(10):
-        perm = rng.permutation(unique_records)
-        n_test = max(1, round(len(perm) * test_frac))
-        n_test = min(n_test, len(perm) - 1)  # always leave >=1 record for train
-        test_records = set(perm[:n_test].tolist())
-        train_records = set(perm[n_test:].tolist())
-        cand_te_mask = np.isin(rec, list(test_records))
-        cand_tr_mask = np.isin(rec, list(train_records))
-        if np.unique(y[cand_te_mask]).size > 1 and np.unique(y[cand_tr_mask]).size > 1:
-            te_mask, tr_mask = cand_te_mask, cand_tr_mask
-            break
-    if te_mask is None:
-        return None  # no record permutation gave both classes on both sides
-
-    te_idx = idx_all[te_mask]
-    tr_idx_full = idx_all[tr_mask]
-
-    # Window-level split of the TRAINING records only, for checkpoint
-    # selection — record-disjointness doesn't matter here since val is
-    # never part of the reported test metric.
-    y_tr_full = data.y[tr_idx_full]
-    if np.unique(y_tr_full).size > 1 and tr_idx_full.size >= 4:
-        from sklearn.model_selection import train_test_split
-        tr_idx, val_idx = train_test_split(
-            tr_idx_full, test_size=val_frac, random_state=seed, stratify=y_tr_full)
-    else:
-        tr_idx, val_idx = tr_idx_full, tr_idx_full
-
-    # The last 3 slots match `case_level.split_data`'s shape (train_modality
-    # only needs *a* grouping value there, unused for training itself) but
-    # carry RECORD ids here, not patient ids — within one patient the patient
-    # id is constant/uninformative, whereas the record id is what this split
-    # actually partitioned on, and is what a leakage check should verify.
-    return (data.X[tr_idx], data.X[val_idx], data.X[te_idx],
-            data.y[tr_idx], data.y[val_idx], data.y[te_idx],
-            data.record_ids[tr_idx], data.record_ids[val_idx], data.record_ids[te_idx])
-
-
-def make_synthetic_eeg(
-    n_samples: int = 800,
-    n_channels: int = len(EEG_MONTAGE),
-    window: int = 128,
-    fs: float = 128.0,
-    abnormal_frac: float = 0.15,
-    noise: float = 0.3,
-    seed: int = 0,
-) -> EegData:
-    """Generate a synthetic seizure/non-seizure EEG-like set: non-seizure
-    windows are band-limited noise per channel; seizure windows add a
-    higher-amplitude rhythmic (spike-wave-like) oscillation shared with
-    correlated timing across channels, roughly mimicking hypersynchronous
-    ictal activity vs. background — a stylised proxy, not a clinical claim
-    (same spirit as the other `make_synthetic_*` generators).
-    """
-    rng = np.random.default_rng(seed)
-    t = np.linspace(0, window / fs, window)
-    X = np.empty((n_samples, n_channels, window), dtype=np.float32)
-    y = np.empty((n_samples,), dtype=np.int64)
-    for i in range(n_samples):
-        seizure = rng.random() < abnormal_frac
-        y[i] = 1 if seizure else 0
-        freq = rng.uniform(2.5, 4.0)  # spike-wave-like frequency if seizure
-        for c in range(n_channels):
-            sig = rng.normal(0, noise, size=window)
-            if seizure:
-                phase = rng.normal(0, 0.1)  # near-shared phase across channels
-                sig = sig + 1.5 * np.sin(2 * np.pi * freq * t + phase)
-            X[i, c] = sig.astype(np.float32)
-    return EegData(X=X, y=y, fs=fs, source="synthetic")
-
-
-def load_eeg(prefer_real: bool = True, require_real: bool = False,
-             **kwargs) -> EegData:
-    """Load EEG data, preferring real CHB-MIT but falling back to synthetic.
-
-    Args:
-        prefer_real: try `load_chbmit()` first.
-        require_real: if real data was requested and fails to load, raise
-            instead of silently substituting synthetic. Every allowed
-            fallback still prints a `[warn]` line naming the reason.
-        **kwargs: forwarded to `load_chbmit` (subjects,
-            seizure_records_per_subject, nonseizure_records_per_subject,
-            window_sec, resample_to, montage, band_pass, neg_per_record,
-            cache_dir, seed, eeg_frontend, n_subwindows, feature_names) when
-            real; ignored when falling back to synthetic (the fallback is
-            always the raw-shaped synthetic generator).
-    """
-    if require_real and not prefer_real:
-        raise ValueError("require_real=True has no effect with prefer_real=False "
-                          "(nothing was asked to be real).")
-    if prefer_real:
-        try:
-            data = load_chbmit(**kwargs)
-            data.requested_real = True
-            return data
-        except Exception as e:  # noqa: BLE001  — any failure -> synthetic (or raise)
-            if require_real:
-                raise RuntimeError(
-                    f"--require-real: real CHB-MIT EEG failed to load ({e}); "
-                    "refusing to silently substitute synthetic EEG."
-                ) from e
-            print(f"[warn] real CHB-MIT EEG unavailable ({e}); falling back to synthetic EEG.")
-    data = make_synthetic_eeg()
-    data.requested_real = prefer_real
-    return data

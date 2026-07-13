@@ -28,6 +28,26 @@ _CARDS = {
         "0 = normal AAMI beat (N/L/R/e/j), 1 = abnormal (V/A/F/!/E).",
         "Real clinical ECG (MIT-BIH). Single-lead, subset of records.",
     ),
+    ("heart", "synthetic"): (
+        "0 = normal S1-S2 'lub-dub' cycle, 1 = added systolic murmur "
+        "(band-limited noise filling the S1-S2 gap) — a stylised proxy for "
+        "valve regurgitation/stenosis.",
+        "Separable by construction — expect ~1.0 accuracy. Proves the "
+        "pipeline, NOT a real-accuracy claim.",
+    ),
+    ("heart", "cinc2016"): (
+        "0 = normal, 1 = abnormal (PhysioNet/CinC Challenge 2016 REFERENCE.csv, "
+        "label 1 = abnormal / -1 = normal). Abnormal = a confirmed cardiac "
+        "diagnosis (typically valve defects or coronary artery disease); the "
+        "challenge does not provide a finer-grained diagnosis.",
+        "Real clinical + non-clinical PCG recordings, ~20.5% abnormal. "
+        "Recordings with signal-quality flag 0 (~4% of training-a) are "
+        "excluded by default (min_quality). SUBJECT IDS ARE NOT RECOVERABLE "
+        "from the distributed files (confirmed, not assumed) despite one "
+        "subject possibly contributing 1-6 recordings — split is by "
+        "RECORDING, not subject; some cross-recording leakage risk is "
+        "possible and not eliminable from this public release.",
+    ),
     ("ppg", "synthetic"): (
         "0 = normovolemic pulse, 1 = hypovolemic (reduced amplitude, blunted "
         "dicrotic notch) — a Compensatory-Reserve-style waveform change.",
@@ -54,27 +74,6 @@ _CARDS = {
         "decrement (see loader for exact threshold).",
         "Real induced central hypovolemia — the intended hemorrhage signal. "
         "Usually few subjects: split by subject, watch N.",
-    ),
-    ("eeg", "synthetic"): (
-        "0 = band-limited noise per channel, 1 = added higher-amplitude "
-        "near-shared-phase rhythmic oscillation across channels (a stylised "
-        "hypersynchrony proxy).",
-        "Separable by construction — proves the multi-channel pipeline "
-        "pattern, NOT a real seizure-detection claim.",
-    ),
-    ("eeg", "chbmit"): (
-        "0 = non-seizure window, 1 = window overlaps an expert-annotated "
-        "seizure interval (CHB-MIT summary files).",
-        "REAL scalp EEG with expert seizure labels — but PEDIATRIC EPILEPSY "
-        "MONITORING, not field TBI (a legitimate 'Head' component — "
-        "post-traumatic seizure / altered mental status — not trauma ground "
-        "truth). Extreme class imbalance (seizures are a tiny fraction of "
-        "continuous recording time) — report AUROC/AUPRC/sensitivity/"
-        "specificity/false-alarms-per-hour, not accuracy. Fixed 6-channel "
-        "bipolar montage (`datasets.EEG_MONTAGE`), not patient-specific. "
-        "Headline metric MUST be subject-independent (split by patient, "
-        "`groups`; chb21 is the same patient as chb01) — a within-patient "
-        "number is not the deployment story.",
     ),
 }
 
@@ -121,10 +120,10 @@ def _modality_of(data) -> str:
     name = type(data).__name__.lower()
     if name.startswith("ecg"):
         return "ecg"
+    if name.startswith("heart"):
+        return "heart"
     if name.startswith("ppg"):
         return "ppg"
-    if name.startswith("eeg"):
-        return "eeg"
     return getattr(data, "modality", "unknown")
 
 
@@ -134,10 +133,10 @@ def data_card(data, model_acc: float | None = None, verbose: bool = True,
     """Build (and optionally print) a data card for one dataset.
 
     Args:
-        data: an EcgData / PpgData / EegData (has .X, .y, .fs, .source). `X`
-            is (n_samples, window) for ECG/PPG or (n_samples, channels,
-            window) for EEG — `window` here always means the LAST axis
-            (time), so it and `duration_s` are correct either way.
+        data: an EcgData / PpgData / HeartData (has .X, .y, .fs, .source).
+            `X` is (n_samples, window); `window` here always means the LAST
+            axis (time), so it and `duration_s` stay correct even for a
+            future multi-channel modality.
         model_acc: optional test accuracy of a trained model on this dataset;
             if within `not_learning_margin` of the base rate, raises a warning.
         verbose: print the card.
