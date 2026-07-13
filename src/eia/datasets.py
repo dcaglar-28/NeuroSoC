@@ -71,6 +71,13 @@ class EegData:
     # window-random split would leak the same seizure event's neighbouring
     # windows across train/test.
     record_ids: np.ndarray | None = None
+    # "raw" (default, delta-encoded waveform, per-window self-normalized —
+    # unchanged legacy behavior) or "features" (docs/eeg_frontend_task.md:
+    # line length / relative band power / spectral entropy per sub-window,
+    # NOT yet normalized — X holds raw feature values). Callers must check
+    # this and run `eeg_features.normalize_features_train_only` on the
+    # "features" case AFTER splitting, never before (train-only fit).
+    frontend: str = "raw"
 
 
 # --------------------------------------------------------------------------- #
@@ -578,6 +585,17 @@ def load_ppg_vitaldb(prefer_real: bool = True, require_real: bool = False,
 # chb08, chb24 — see docs/eeg_seizure_task.md Part 0).
 EEG_MONTAGE = ["FP1-F7", "F7-T7", "FP2-F8", "F8-T8", "FZ-CZ", "CZ-PZ"]
 
+# Channel subset for the FEATURE front-end (docs/eeg_frontend_task.md):
+# left+right temporal (a common seizure-focus region, matching the reasoning
+# behind EEG_MONTAGE itself), trimmed to 2 of the 6 EEG_MONTAGE channels so
+# `len(FEATURE_NAMES) * len(FEATURE_MONTAGE) * 2` (features x channels, x2
+# for the existing ON/OFF delta encoder every other modality already uses)
+# lands exactly on Xylo's 16-input ceiling: 4 features x 2 channels x 2 = 16.
+# See docs/eeg_frontend_results.md for the full input-count accounting
+# (including why this is stricter than the task doc's illustrative "4ch x
+# 4 features = 16" arithmetic, which didn't account for the ON/OFF doubling).
+FEATURE_MONTAGE = ["F7-T7", "F8-T8"]
+
 EEG_NATIVE_FS = 256.0  # CHB-MIT's fixed sampling rate, confirmed via wfdb
 
 # chb21 is the SAME PATIENT as chb01 (a second recording session) — CHB-MIT's
@@ -737,6 +755,21 @@ def _fetch_chbmit_summary(subject: str, cache_dir: str, timeout_sec: float = 30.
     return parse_chbmit_summary(text)
 
 
+def _montage_cache_tag(montage: list) -> str:
+    """Filename-safe signature distinguishing WHICH channel montage a cached
+    record's array holds. The raw (`EEG_MONTAGE`, 6ch) and feature
+    (`FEATURE_MONTAGE`, 2ch) front-ends select DIFFERENT channels from the
+    same subject/record, so the cache key must depend on the montage, not
+    just subject+record — otherwise a cache hit could silently hand back the
+    wrong channels (e.g. all 6 raw channels when the feature front-end asked
+    for exactly 2). Empty for the default `EEG_MONTAGE` so files already
+    cached before this distinction existed still hit — no forced re-download.
+    """
+    if list(montage) == EEG_MONTAGE:
+        return ""
+    return "_" + "-".join(ch.replace("-", "") for ch in montage)
+
+
 def _load_chbmit_record_montage(subject: str, record: str, montage: list,
                                  cache_dir: str):
     """Stream one CHB-MIT record's EDF via wfdb, select the fixed montage,
@@ -745,10 +778,26 @@ def _load_chbmit_record_montage(subject: str, record: str, montage: list,
     23-channel, ~42 MB-per-hour EDF every time.
     """
     import os
-    path = os.path.join(cache_dir, f"{subject}_{record}_montage.npz")
+    tag = _montage_cache_tag(montage)
+    path = os.path.join(cache_dir, f"{subject}_{record}_montage{tag}.npz")
     if os.path.exists(path):
         d = np.load(path)
         return d["sig"], float(d["fs"])
+
+    # If every requested channel is already present in the default
+    # EEG_MONTAGE's cache (true for FEATURE_MONTAGE, a subset of it), derive
+    # this montage from that instead of re-downloading the EDF — this is
+    # exactly what lets the feature front-end reuse the already-cached raw
+    # 4-patient pool with zero new network access.
+    default_path = os.path.join(cache_dir, f"{subject}_{record}_montage.npz")
+    if tag and os.path.exists(default_path) and all(ch in EEG_MONTAGE for ch in montage):
+        d = np.load(default_path)
+        idx = [EEG_MONTAGE.index(ch) for ch in montage]
+        sig, fs = d["sig"][:, idx], float(d["fs"])
+        os.makedirs(cache_dir, exist_ok=True)
+        np.savez(path, sig=sig, fs=fs)  # cache the derived subset too
+        return sig, fs
+
     from wfdb.io.convert.edf import read_edf
     os.makedirs(cache_dir, exist_ok=True)
     h = read_edf(record + ".edf", pn_dir=f"chbmit/{subject}")
@@ -772,13 +821,33 @@ def load_chbmit(
     verbose: bool = True,
     record_timeout_sec: float = 300.0,
     retries: int = 1,
+    eeg_frontend: str = "raw",
+    n_subwindows: int = 8,
+    feature_names: tuple | None = None,
 ) -> EegData:
     """Stream CHB-MIT scalp EEG, windowed and labelled for seizure detection.
 
-    Hardware-first pipeline (docs/eeg_seizure_task.md): 23 native channels ->
-    fixed 6-channel bipolar montage (`EEG_MONTAGE`) -> band-pass to the
-    seizure band -> per-window z-score -> FFT-resample to `resample_to`
-    Xylo timesteps. Requires `wfdb` (`pip install 'eia[data]'`) and network.
+    Two selectable front-ends (`eeg_frontend`, docs/eeg_frontend_task.md):
+
+    - `"raw"` (default, unchanged from before): 23 native channels -> fixed
+      6-channel bipolar montage (`EEG_MONTAGE`) -> band-pass to the seizure
+      band -> per-window self z-score -> FFT-resample to `resample_to` Xylo
+      timesteps -> delta-encoded downstream. Captures *edges*; the diagnosis
+      in docs/eeg_seizure_results.md found this starves the float model
+      (~chance on both subject-independent and patient-specific splits).
+    - `"features"`: the redesign. Same montage-select + band-pass, but each
+      window is split into `n_subwindows` sub-windows (the SNN's timesteps)
+      and reduced to physiologically-grounded features per channel — line
+      length, relative band power, spectral entropy (`eia.eeg_features`) —
+      captures *sustained rhythmic evolution* instead of edges. Uses the
+      smaller `FEATURE_MONTAGE` (not `EEG_MONTAGE`) by default to keep
+      features x channels x 2 (existing ON/OFF delta doubling) within
+      Xylo's 16-input ceiling. Returned `EegData.X` holds RAW
+      (un-normalized) feature values — normalization must be fit on the
+      TRAIN split only (`eeg_features.normalize_features_train_only`),
+      never inside this function, which doesn't know the split.
+
+    Requires `wfdb` (`pip install 'eia[data]'`) and network.
 
     Resumable and watchable (each ~40MB EDF pull used to be silent and
     unbounded, so a big subject list just looked hung for hours, and one
@@ -808,7 +877,11 @@ def load_chbmit(
             `resample_to`, same decoupling as `datasets.load_mitbih`).
         resample_to: FFT-resample each window from `window_sec * 256` native
             samples down to this many Xylo timesteps; None keeps native.
-        montage: override the fixed channel list (default `EEG_MONTAGE`).
+            Ignored when `eeg_frontend="features"` (`n_subwindows` sets the
+            timestep count there instead).
+        montage: override the channel list. Default is `eeg_frontend`-
+            dependent: `EEG_MONTAGE` (6ch) for `"raw"`, `FEATURE_MONTAGE`
+            (2ch) for `"features"`.
         band_pass: seizure-band Butterworth cutoffs in Hz.
         neg_per_record: cap on non-seizure windows kept per record (a 1-hour
             record has ~900 windows at window_sec=4; keeping all of them
@@ -827,6 +900,16 @@ def load_chbmit(
             record that times out is skipped, same as one that raises.
         retries: extra attempts (beyond the first) per summary fetch / EDF
             read before giving up and skipping.
+        eeg_frontend: `"raw"` (default) or `"features"` — see above.
+        n_subwindows: `"features"` only — split each `window_sec` window
+            into this many equal sub-windows (the SNN's timesteps); each
+            must be long enough for a usable Welch PSD estimate (default 8
+            -> 0.5s / 128 samples at native 256 Hz).
+        feature_names: `"features"` only — override which features are
+            computed (default `eeg_features.FEATURE_NAMES`; any subset of
+            `("line_length", "delta", "theta", "alpha", "beta",
+            "spectral_entropy")`, mind the input-budget math in
+            `FEATURE_MONTAGE`'s docstring if you widen this).
 
     Returns:
         EegData with `source="chbmit"`, `groups` = canonical patient id per
@@ -840,13 +923,32 @@ def load_chbmit(
     import os
     import time
 
+    if eeg_frontend not in ("raw", "features"):
+        raise ValueError(f"eeg_frontend must be 'raw' or 'features', got {eeg_frontend!r}")
+
     subjects = subjects or DEFAULT_EEG_SUBJECTS
-    montage = montage or EEG_MONTAGE
+    if montage is None:
+        montage = FEATURE_MONTAGE if eeg_frontend == "features" else EEG_MONTAGE
+    if eeg_frontend == "features" and feature_names is None:
+        from eia import eeg_features
+        feature_names = eeg_features.FEATURE_NAMES
     rng = np.random.default_rng(seed)
     window_native = int(round(window_sec * EEG_NATIVE_FS))
+    _tag = _montage_cache_tag(montage)
 
     def _cache_path(subject, record):
-        return os.path.join(cache_dir, f"{subject}_{record}_montage.npz")
+        return os.path.join(cache_dir, f"{subject}_{record}_montage{_tag}.npz")
+
+    def _is_cached(subject, record):
+        # A hit either at this montage's own cache path, or derivable
+        # without a download from the default EEG_MONTAGE cache (see
+        # _load_chbmit_record_montage) -- matches what will actually avoid
+        # a network call, so the printed plan isn't misleadingly pessimistic.
+        if os.path.exists(_cache_path(subject, record)):
+            return True
+        if _tag and all(ch in EEG_MONTAGE for ch in montage):
+            return os.path.exists(os.path.join(cache_dir, f"{subject}_{record}_montage.npz"))
+        return False
 
     # Phase 1: fetch each subject's summary (small text file) and enumerate
     # the records to pull, so the FULL plan — including cache-hit/miss for
@@ -865,17 +967,17 @@ def load_chbmit(
             r for r, sz in summary.items() if not sz)[:nonseizure_records_per_subject]
         plan.extend((subject, record) for record in seizure_recs + nonseizure_recs)
 
-    n_cached = sum(1 for s, r in plan if os.path.exists(_cache_path(s, r)))
+    n_cached = sum(1 for s, r in plan if _is_cached(s, r))
     if verbose:
         print(f"[chbmit] plan: {len(plan)} records total "
               f"({n_cached} cached, {len(plan) - n_cached} to download, "
-              f"cache_dir={cache_dir!r})")
+              f"eeg_frontend={eeg_frontend!r}, cache_dir={cache_dir!r})")
 
     # Phase 2: load each planned record — cache hits are near-instant, a
     # download is the ~40MB/record cost the plan above just quantified.
     X_list, y_list, group_list, record_list = [], [], [], []
     for i, (subject, record) in enumerate(plan, 1):
-        cache_hit = os.path.exists(_cache_path(subject, record))
+        cache_hit = _is_cached(subject, record)
         if verbose:
             print(f"[chbmit] {subject}/{record} ({i}/{len(plan)}) "
                   f"{'cache hit' if cache_hit else 'downloading...'}")
@@ -905,7 +1007,13 @@ def load_chbmit(
         patient = eeg_canonical_patient(subject)
         for w in pos_w + neg_w:
             seg = filtered[w * window_native:(w + 1) * window_native, :].T  # (n_ch, window)
-            X_list.append(seg.astype(np.float32))
+            if eeg_frontend == "features":
+                from eia import eeg_features
+                feat = eeg_features.extract_window_features(
+                    seg, fs, n_subwindows, feature_names)  # (features*n_ch, n_subwindows)
+                X_list.append(feat.astype(np.float32))
+            else:
+                X_list.append(seg.astype(np.float32))
             y_list.append(1 if w in pos_w else 0)
             group_list.append(patient)
             record_list.append(record)
@@ -919,17 +1027,28 @@ def load_chbmit(
     if not X_list:
         raise RuntimeError("No EEG windows extracted from CHB-MIT.")
 
-    X = np.stack(X_list)  # (n, n_ch, window_native)
-    fs_eff = EEG_NATIVE_FS
-    if resample_to is not None and resample_to != window_native:
-        X = resample_windows(X, resample_to)
-        fs_eff = EEG_NATIVE_FS * (resample_to / window_native)
-    X = (X - X.mean(axis=-1, keepdims=True)) / (X.std(axis=-1, keepdims=True) + 1e-8)
+    X = np.stack(X_list)  # (n, C, T) -- (n_ch, window_native) raw, or
+                           # (features*n_ch, n_subwindows) features
+    if eeg_frontend == "features":
+        # fs of the TIMESTEP axis (sub-windows), not the native EEG rate --
+        # matches report.data_card's generic `duration_s = window / fs`.
+        fs_eff = n_subwindows / window_sec
+        # Deliberately NOT normalized here -- z-score stats must be fit on
+        # the TRAIN split only (eeg_features.normalize_features_train_only),
+        # and this function doesn't know the split. Leaving X as raw feature
+        # values is the guard against silently leaking val/test into the fit.
+    else:
+        fs_eff = EEG_NATIVE_FS
+        if resample_to is not None and resample_to != window_native:
+            X = resample_windows(X, resample_to)
+            fs_eff = EEG_NATIVE_FS * (resample_to / window_native)
+        X = (X - X.mean(axis=-1, keepdims=True)) / (X.std(axis=-1, keepdims=True) + 1e-8)
 
     return EegData(X=X.astype(np.float32), y=np.array(y_list, dtype=np.int64),
                     fs=fs_eff, source="chbmit",
                     groups=np.array(group_list, dtype="<U8"),
-                    record_ids=np.array(record_list, dtype="<U16"))
+                    record_ids=np.array(record_list, dtype="<U16"),
+                    frontend=eeg_frontend)
 
 
 def eeg_patient_specific_split(data: "EegData", patient: str, seed: int,
@@ -1048,8 +1167,9 @@ def load_eeg(prefer_real: bool = True, require_real: bool = False,
         **kwargs: forwarded to `load_chbmit` (subjects,
             seizure_records_per_subject, nonseizure_records_per_subject,
             window_sec, resample_to, montage, band_pass, neg_per_record,
-            cache_dir, seed) when real; ignored when falling back to
-            synthetic.
+            cache_dir, seed, eeg_frontend, n_subwindows, feature_names) when
+            real; ignored when falling back to synthetic (the fallback is
+            always the raw-shaped synthetic generator).
     """
     if require_real and not prefer_real:
         raise ValueError("require_real=True has no effect with prefer_real=False "

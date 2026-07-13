@@ -347,12 +347,15 @@ open labels.
 - **C (Circulation) — DONE.** ECG arrhythmia on real MIT-BIH is the one modality
   genuinely learning on real data (float balanced acc 0.845). On-chip XyloSim
   fidelity (~0.56) is the open engineering gap, not a data gap.
-- **H (Head) — Phase 1 EEG pipeline built and Xylo-verified; both
-  subject-independent AND the patient-specific diagnostic are ~chance at the
-  local data scale run so far — points toward the front-end (montage/band/
-  timesteps) as a live suspect, not just "need more patients." See
-  docs/eeg_seizure_results.md and notebooks/02_eeg_seizure.ipynb (Colab, run
-  this before treating "front-end too lossy" as final).**
+- **H (Head) — Phase 1 EEG pipeline built and Xylo-verified. Front-end
+  redesign tested (feature-based: line length / band power / spectral
+  entropy) and it did NOT clear chance either — statistically indistinguishable
+  from the raw baseline on the same 4-patient pool, both splits. Front-end
+  representation is ruled out as the standalone fix; next suspects are
+  montage/channel choice and true data scale, neither attempted yet. See
+  docs/eeg_frontend_results.md (latest), docs/eeg_seizure_results.md, and
+  notebooks/02_eeg_seizure.ipynb (Colab, larger-scale rerun still useful for
+  the scale question).**
   Split into two independent workstreams:
   - **EEG:** seizure detection on **CHB-MIT** (open, WFDB-via-`read_edf`,
     expert seizure labels, decades of benchmarks). Task spec:
@@ -393,6 +396,31 @@ open labels.
     `datasets.DEFAULT_EEG_SUBJECTS`. Metrics reported are AUROC/AUPRC/
     sensitivity/specificity/FA-per-hour, NOT accuracy (extreme imbalance),
     per the task spec. Caveat: CHB-MIT is pediatric epilepsy, not field TBI.
+    **Part 3 — feature-based front-end redesign** (`eia.eeg_features`:
+    line length + relative delta/beta band power + spectral entropy per
+    0.5s sub-window, `eeg_frontend="features"` in `load_chbmit`, selectable
+    alongside the unchanged raw path via `--eeg-frontend`) responded
+    directly to Part 1/2's finding that the FLOAT model was at chance —
+    the classic hypothesis being that raw delta-encoding captures edges,
+    not the sustained rhythmic/spectral shift that defines a seizure.
+    **Measured on the same 4-patient/868-window pool, both splits, 5 seeds:
+    features did NOT clear chance either** (subject-independent bal acc
+    0.527 +/- 0.024 vs. raw's 0.551 +/- 0.042; patient-specific 0.488 +/- 0.073
+    vs. raw's 0.521 +/- 0.071 — nominally lower, well within noise of each
+    other, neither clearing 0.5 outside its own seed band). Notably, the two
+    patients (chb02, chb03) that showed raw's only mild positive signal
+    (~0.59 AUROC) dropped to ~0.47-0.48 under features — the opposite of
+    what "front-end was the bottleneck" would predict. Feature x channel
+    layout: 2 channels (`FEATURE_MONTAGE` = F7-T7, F8-T8) x 4 features =
+    8 feature-channels x2 (existing ON/OFF delta encoder, reused unchanged)
+    = 16 spike channels, confirmed `input 16/16` in the footprint — exactly
+    Xylo's ceiling, zero headroom (the committed Akida decision loosens
+    this, a concrete point in its favor). Per the task's explicit
+    instruction, NOT chased further (no bigger feature set, no channel
+    sweep) — see docs/eeg_frontend_results.md for the full honest write-up.
+    Next suspects, neither attempted: montage/channel choice (only 2 of 6
+    available channels used, purely to fit Xylo's budget) and true data
+    scale (4 patients is still small).
     Phase 2 = TUSZ (registration-gated) + Siena generalization; Phase 3 = TBI
     spectral screening (slowing, burst suppression) — a different task.
   - **Thermal / hypothermia (later):** no open CHB-MIT-equivalent — likely a

@@ -189,6 +189,16 @@ def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
     Xtr, Xval, Xte, ytr, yval, yte, _groups_tr, _groups_val, _groups_te = \
         split_fn(data, seed)
 
+    # Feature front-end (docs/eeg_frontend_task.md): X holds RAW feature
+    # values out of the loader (line length is in raw signal units, band
+    # power is a [0,1] fraction, spectral entropy is [0,1] -- wildly
+    # different scales). Z-score fit on Xtr ONLY, applied to Xval/Xte, here
+    # (post-split) rather than in the loader (pre-split) -- fitting on the
+    # loader's full pool would leak val/test statistics into training.
+    if getattr(data, "frontend", "raw") == "features":
+        from eia import eeg_features
+        Xtr, Xval, Xte = eeg_features.normalize_features_train_only(Xtr, Xval, Xte)
+
     Rtr = torch.tensor(_encode_batch(Xtr, threshold))
     Rval = torch.tensor(_encode_batch(Xval, threshold))
     Rte = torch.tensor(_encode_batch(Xte, threshold))
@@ -741,6 +751,14 @@ def main():
                           "patient data' from 'the front-end destroyed the "
                           "seizure signal'; see docs/eeg_seizure_task.md). "
                           "Ignored for ecg/ppg.")
+    ap.add_argument("--eeg-frontend", choices=["raw", "features"], default="raw",
+                     help="eeg only: 'raw' (default, delta-encoded waveform "
+                          "— the diagnosed-as-~chance baseline) or 'features' "
+                          "(line length / relative band power / spectral "
+                          "entropy per sub-window — docs/eeg_frontend_task.md). "
+                          "'features' uses datasets.FEATURE_MONTAGE (2ch) by "
+                          "default, not the 6ch EEG_MONTAGE, to stay under "
+                          "Xylo's 16-input ceiling after ON/OFF delta doubling.")
     args = ap.parse_args()
     real = args.real or args.require_real
     loader_kwargs = {}
@@ -766,6 +784,9 @@ def main():
         eeg_loader_kwargs["seizure_records_per_subject"] = args.eeg_seizure_records
     if args.eeg_nonseizure_records is not None:
         eeg_loader_kwargs["nonseizure_records_per_subject"] = args.eeg_nonseizure_records
+    if args.eeg_frontend == "features":
+        eeg_loader_kwargs["eeg_frontend"] = "features"
+        eeg_loader_kwargs.pop("resample_to", None)  # features use n_subwindows, not resample_to
 
     n_seeds = max(1, args.n_seeds)
 
