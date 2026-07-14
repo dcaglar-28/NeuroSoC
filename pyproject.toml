@@ -23,6 +23,11 @@ data = ["wfdb>=4.1", "vitaldb>=1.5"]
 # Xylo deployment + bit-accurate simulator (SynSense Rockpool). "xylo" extra
 # pulls the XyloSim backend so you can verify on-chip behaviour without hardware.
 xylo = ["rockpool[xylo]>=3.1"]
+# Akida deployment + software simulator (BrainChip MetaTF). NO macOS wheel exists
+# for `akida` (confirmed against every release on PyPI, Linux/Windows only) — this
+# extra only installs inside the Linux container (see Dockerfile.akida / README's
+# "Verify on Akida" section). Version-pinned: cnn2snn hard-pins `akida==2.19.2`.
+akida = ["akida==2.19.2", "quantizeml~=1.2.2", "cnn2snn~=2.19.0", "akida_models~=1.14.1"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

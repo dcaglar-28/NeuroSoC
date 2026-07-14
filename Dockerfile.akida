@@ -1,0 +1,84 @@
+# Akida/MetaTF dev container (docs/akida_retarget_task.md).
+#
+# WHY A CONTAINER: BrainChip's `akida` package (the actual execution-engine /
+# software simulator -- everything else in MetaTF depends on it) publishes NO
+# macOS wheel, in ANY of its PyPI releases -- confirmed against every release's
+# file list (Linux manylinux_2_28 aarch64/x86_64 and Windows win_amd64 only).
+# This is a hard platform blocker on the M-series Mac this repo is developed on,
+# not a version mismatch -- hence this container instead of a host-venv extra.
+#
+# Python 3.11: akida supports cp310-cp312; cnn2snn 2.19.2 (which akida==2.19.2
+# pins) requires tensorflow~=2.19.0, whose wheels cap at Python 3.11 for this
+# line. (Earlier project notes assumed TF 2.15 based on an older quantizeml --
+# re-verified against the CURRENTLY installed/resolvable metadata per this
+# repo's own Part-0 discipline: the actual pin is 2.19.x, not 2.15.)
+#
+# Runs natively on linux/arm64 (Apple Silicon under Colima/Docker, no emulation)
+# and linux/amd64 (Intel/CI) -- akida ships wheels for both.
+FROM python:3.11-slim
+
+# build-essential: quantizeml/cnn2snn/akida_models ship as sdists (no wheel at
+# all on PyPI, any platform) so pip always builds them locally -- pure Python,
+# fast, but needs a C toolchain present for their own transitive deps (e.g.
+# onnxruntime's build probe) to not fail outright. libsndfile1/libgl1/ffmpeg:
+# runtime shared libs akida_models' audio/vision extras (librosa, soundata,
+# opencv) dlopen at import time, not just at build time -- missing them fails
+# at `import akida_models`, not at pip install time.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    libsndfile1 \
+    libgl1 \
+    libglib2.0-0 \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# --- Layer 1: MetaTF, EXACTLY pinned (top to bottom of the real dependency
+# chain: akida pins cnn2snn's compatible range, cnn2snn pins tensorflow/
+# tf_keras/quantizeml's compatible ranges -- confirmed against the actual
+# PyPI metadata, not assumed). Every package here has an exact `==`, so pip's
+# resolver has ZERO top-level version ambiguity to backtrack over -- this is
+# what actually fixes the multi-hour hang from the first build attempt (NOT a
+# wheel-build slowness -- quantizeml/cnn2snn/akida_models's sdist builds are
+# each a few seconds; the resolver was backtracking across a huge combined
+# unconstrained graph that ALSO included eia's full dependency set, see Layer
+# 2's comment). This layer changes only when these pins change, so it's the
+# most cacheable step -- put first, deliberately, ahead of copying repo source.
+#
+# Plain `tensorflow`, not `tensorflow-cpu`: confirmed via PyPI metadata that
+# tensorflow's nvidia-*-cu12 deps are gated behind an `and-cuda` EXTRA, never
+# installed by a plain `pip install tensorflow` -- so tensorflow was never the
+# source of the earlier build's multi-GB NVIDIA CUDA download. `tensorflow-cpu`
+# also isn't what cnn2snn actually declares (`tensorflow~=2.19.0` by exact
+# package name), so installing it instead would just add a second, unrelated
+# package without satisfying cnn2snn's real requirement.
+RUN pip install --no-cache-dir -v \
+    tensorflow==2.19.1 \
+    tf_keras==2.19.0 \
+    akida==2.19.2 \
+    quantizeml==1.2.4 \
+    cnn2snn==2.19.2 \
+    akida_models==1.14.1
+
+# --- Layer 2: eia itself, WITHOUT its declared dependencies (`--no-deps`).
+# eia's pyproject.toml hard-requires torch+snntorch (for the Rockpool/XyloSim
+# research path) -- and on Linux, plain `pip install torch` unconditionally
+# pulls nvidia-cudnn-cu13/nvidia-nccl-cu13/nvidia-cusparselt-cu13/
+# nvidia-nvshmem-cu13 (multi-GB, confirmed via PyPI metadata: gated behind
+# `platform_system == "Linux"`, NOT behind an opt-in extra the way
+# tensorflow's CUDA deps are) -- THIS, not tensorflow, was the actual source
+# of the first build's disk blowup. The ECG Akida path never imports torch
+# (eia's torch usage is lazy, confined to models.py/rockpool_models.py/
+# train.py), so it's skipped entirely here rather than worked around. Only
+# the packages the ECG data path (datasets.load_ecg/load_mitbih, report,
+# case_level's leakage-safe split) actually needs are installed explicitly.
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN pip install --no-cache-dir --no-deps -e . \
+    && pip install --no-cache-dir wfdb numpy scipy scikit-learn pytest
+
+COPY . .
+
+CMD ["/bin/bash"]

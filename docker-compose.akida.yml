@@ -1,0 +1,19 @@
+# Akida/MetaTF dev container (docs/akida_retarget_task.md). See the
+# "Verify on Akida" section of README.md and scripts/akida_docker_run.sh for a
+# plain `docker` equivalent if you don't have the compose plugin installed.
+#
+#   docker compose -f docker-compose.akida.yml build
+#   docker compose -f docker-compose.akida.yml run --rm akida bash
+#   docker compose -f docker-compose.akida.yml run --rm akida pytest -q
+services:
+  akida:
+    build:
+      context: .
+      dockerfile: Dockerfile.akida
+    volumes:
+      # Bind-mount the repo so edits and any files the container writes
+      # (docs/akida_ecg_results.md, akida-cache artifacts, etc.) land on the
+      # host and are what actually gets committed -- the container is a
+      # toolchain, not a separate copy of the repo.
+      - .:/workspace
+    working_dir: /workspace

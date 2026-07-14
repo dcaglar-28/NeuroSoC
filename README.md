@@ -139,6 +139,52 @@ prior), and co-residence measurably costs some XyloSim fidelity vs. either
 modality's standalone number under a shared 8-bit weight budget. All
 documented in `rockpool_models.py` and `scripts/xylo_verify.py`.
 
+## Verify on Akida (committed production target — ECG first slice)
+
+BrainChip **Akida** (MetaTF toolchain) is the committed production silicon
+(see CLAUDE.md's "Hardware target"); this repo also validates on Rockpool/
+XyloSim (above) because it's a mature bit-exact simulator available today.
+`docs/akida_retarget_task.md` is the full re-target plan; this is its first,
+minimal slice — ECG only, everything else stays on the Xylo path untouched.
+
+**Linux only — needs a container.** BrainChip's `akida` package (the actual
+execution-engine / software simulator) publishes no macOS wheel, in any of
+its PyPI releases, ever — confirmed against the full release history, not
+assumed. Build and run the dev container (native `linux/arm64` on an
+M-series Mac via Docker/Colima, no emulation; also builds on `linux/amd64`):
+
+```bash
+# one-time: a container runtime, if you don't already have one
+brew install docker colima && colima start --cpu 4 --memory 8 --root-disk 80
+#   ^ root-disk matters: colima's default (20GiB) is too small for
+#     tensorflow + the rest of MetaTF's dependency tree; --disk alone is a
+#     SEPARATE data volume, not what Docker's image storage actually uses.
+
+scripts/akida_docker_run.sh                                   # interactive shell
+scripts/akida_docker_run.sh pytest -q                          # tests run for real here (skipped on macOS)
+scripts/akida_docker_run.sh python scripts/akida_verify.py --real --n-seeds 5
+```
+
+(`docker-compose.akida.yml` is the compose-plugin equivalent, if you have it.)
+
+For ECG: a data card, then the **float** model's balanced accuracy/per-class
+recall/AUROC (train first, same class-weighted-loss + balanced-accuracy-
+checkpoint-selection discipline as the Xylo path), then the **Akida
+software-simulator's** accuracy and its agreement with the float model, then
+the mapped input-channel footprint. See `docs/akida_ecg_results.md` for the
+full write-up: the confirmed Akida v2 layer constraints that shaped the
+architecture (square kernel/stride/pool on every conv layer, specific valid
+layer-ordering patterns), the Part-0 finding that BrainChip does **not**
+publish an explicit bit/cycle-accurate claim for the software simulator the
+way SynSense does for XyloSim, and the measured comparison against Xylo's
+known ECG fidelity gap (float 0.845 balanced acc → XyloSim ~0.56 agreement).
+
+`src/eia/akida_models.py` (deploy sibling of `rockpool_models.py`, which
+stays untouched) builds a small quantized Conv2D-over-time CNN — Akida 2.0
+has no native Conv1D, so the ECG window is treated as a `(window, 1, 1)`
+single-column "image," the simplest mapping for this first slice (TENN,
+Akida's genuinely temporal layer family, is the noted alternative for later).
+
 ## Run the tests
 
 ```bash

@@ -1,0 +1,41 @@
+# Mirrors .gitignore. Keeps the Docker build context small and fast --
+# without this, the ~25GB of gitignored cached datasets under data/ (MIT-BIH/
+# CHB-MIT/CinC2016/VitalDB downloads from prior sessions) gets copied into
+# every image layer, which is both slow and can exhaust the build
+# environment's disk (confirmed: this caused a real "no space left on
+# device" build failure before this file existed).
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+.venv/
+venv/
+env/
+
+data/
+
+*.edf
+*.edf.seizures
+*.npy
+*.npz
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+checkpoints/
+outputs/
+*.pt
+*.pth
+
+.ipynb_checkpoints/
+
+.DS_Store
+.vscode/
+.idea/
+
+.git/
+.claude/
