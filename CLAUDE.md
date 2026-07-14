@@ -63,8 +63,24 @@ without waiting on Akida/MetaTF tooling access:
   measured** and will need re-characterization after porting to
   MetaTF/Akida — not assumed to carry over as-is.
 
-**Roadmap (future, not started, deferred until hardware access):**
-re-target the validated pipeline onto BrainChip MetaTF/Akida.
+**Re-target onto MetaTF/Akida — IN PROGRESS, first slice done (ECG only).**
+**The Xylo fidelity gap essentially closes on this measurement**: float 0.928
+balanced acc -> Akida-sim 0.926 (5 seeds, real MIT-BIH), agreement 0.981 +/-
+0.007 -- vs. Xylo's float 0.845 -> XyloSim ~0.56 (~agreement 0.56) on the
+same task. Different architecture (quantized Conv2D CNN via quantizeml/
+cnn2snn, not an LIF SNN), so the float baselines aren't directly comparable,
+but the float->on-chip DROP -- the thing XyloSim/Akida-sim exist to measure
+-- is dramatically smaller here. Caveat carried from Part 0: BrainChip does
+NOT publish an explicit bit/cycle-accurate claim for the software simulator
+the way SynSense does for XyloSim (checked 3 official sources) -- this is
+"Akida-sim agreement," not a confirmed-bit-exact-to-silicon number. `akida`
+has no macOS wheel (any release, ever — Linux/Windows only), so this runs in
+a Docker container (`Dockerfile.akida`, `scripts/akida_docker_run.sh`; see
+README's "Verify on Akida"), not the host venv. See `docs/akida_ecg_results.md`
+for the full write-up: Part-0 toolchain/fidelity findings, the confirmed
+Akida v2 layer constraints, and the measured float/Akida-sim numbers vs. the
+Xylo gap. Remaining scope from `docs/akida_retarget_task.md` (other modalities, TENN,
+on-chip-learning demo, co-residence re-eval) is not started.
 
 ## Xylo pipeline (Rockpool)
 - `src/eia/models.py` (snnTorch) = fast local research. `src/eia/rockpool_models.py`
