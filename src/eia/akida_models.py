@@ -1,11 +1,18 @@
-"""Akida deployment & verification path (BrainChip MetaTF) — ECG only, first slice.
+"""Akida deployment & verification path (BrainChip MetaTF) — ECG + heart sounds.
 
 Deploy sibling of `rockpool_models.py` (which stays untouched). Where
-`rockpool_models.py` maps a Rockpool LIF SNN onto Xylo, this module builds a
-small **quantized 1-D CNN** (Conv2D layers with a (k,1)/(1,k)-shaped kernel,
-treating the ECG window's time axis as image "height") and runs it on
-**MetaTF**: `quantizeml` (quantization/calibration) -> `cnn2snn` (Keras ->
-Akida conversion) -> `akida.Model` (software simulator, no hardware needed).
+`rockpool_models.py` maps a Rockpool LIF SNN onto Xylo, this module builds
+small **quantized Conv2D CNNs** and runs them on **MetaTF**: `quantizeml`
+(quantization/calibration) -> `cnn2snn` (Keras -> Akida conversion) ->
+`akida.Model` (software simulator, no hardware needed). Two model builders,
+sharing everything downstream (`quantize_and_convert`/`verify_against_sim`
+are fully generic — no ECG- or heart-specific shape assumptions):
+  - `build_akida_model` (ECG): a single-channel waveform reshaped to a
+    (window, 1, 1) single-column "image" — Conv2D-over-time, one real axis.
+  - `build_akida_heart_model` (heart sounds): the `signal_features`
+    filterbank's `(n_features, n_subwindows)` map used AS a genuine 2-D
+    image (bands x time), both axes real — see its docstring for why this
+    needed a different first-layer shape than ECG's.
 
 WHY A CONV2D-OVER-TIME, NOT A NATIVE CONV1D: Akida 2.0's layer catalog (see
 `docs/akida_ecg_results.md` Part 0) has no Conv1D — the closest fits are
@@ -100,19 +107,34 @@ DEFAULT_ACTIVATION_BITS = 8
 
 
 def to_akida_input(X: np.ndarray) -> np.ndarray:
-    """Convert a real-valued `(n, window)` batch into Akida's expected
-    `(n, window, 1, 1)` uint8 input format, via per-window min-max
-    normalization to [0, 255] — the same spirit as image pixel values, which
-    is what Akida's InputConv2D layer is built to expect. `window` becomes
-    the "image height" (the time axis); width and channels are both 1
-    (single-channel ECG, one window per "image").
+    """Convert a real-valued batch into Akida's expected uint8 image format,
+    via per-ROW min-max normalization to [0, 255] (the same spirit as image
+    pixel values, which is what Akida's InputConv2D layer is built to
+    expect) — the last axis is normalized independently per (sample, ...
+    leading axes) slice.
+
+    Two input shapes, two output shapes (ECG's `(n, window)` path is
+    UNCHANGED from before heart sounds was added — same call, same output):
+      - `(n, window)` (ECG: single-channel waveform) -> `(n, window, 1, 1)`.
+        `window` becomes the "image height" (time axis); width/channels=1.
+      - `(n, H, W)` (heart: `(n_features, n_subwindows)` filterbank map from
+        `eia.signal_features` — see `build_akida_heart_model`) -> `(n, H, W,
+        1)`. Normalizing per-row (per feature/band) rather than per-whole-
+        sample preserves each feature's own dynamic range (line length,
+        band power, and spectral entropy are on very different natural
+        scales even after `signal_features.normalize_features_train_only`'s
+        z-score — this is an additional, deliberately independent [0, 255]
+        remap per row, same as ECG's per-window remap).
     """
     X = np.asarray(X, dtype=np.float64)
     lo = X.min(axis=-1, keepdims=True)
     hi = X.max(axis=-1, keepdims=True)
     span = np.where(hi > lo, hi - lo, 1.0)
     scaled = (X - lo) / span * 255.0
-    return scaled.astype(np.uint8)[..., None, None]
+    out = scaled.astype(np.uint8)
+    if X.ndim == 2:
+        return out[..., None, None]  # (n, window) -> (n, window, 1, 1)
+    return out[..., None]  # (n, H, W) -> (n, H, W, 1)
 
 
 def build_akida_model(window: int = 187, n_classes: int = 2):
@@ -146,6 +168,48 @@ def build_akida_model(window: int = 187, n_classes: int = 2):
     x = dense_block(x, units=n_classes, name="predictions",
                      add_batchnorm=False, relu_activation=False)
     return Model(img_input, x, name="ecg_akida")
+
+
+def build_akida_heart_model(n_bands: int = 4, n_subwindows: int = 24, n_classes: int = 2):
+    """Build the float `tf_keras.Model` heart-sound classifier over the
+    `(n_bands, n_subwindows, 1)` filterbank-feature "image"
+    (`eia.signal_features.extract_window_features`'s `(n_features,
+    n_subwindows)` output, matching `datasets.PCG_FEATURE_NAMES`'s default 4
+    features x `n_subwindows=24` sub-windows) — a Conv2D-native fit, unlike
+    ECG's single-column `(window, 1, 1)` reshape: here BOTH spatial axes
+    carry real structure (bands x time), not one real axis and one phantom
+    one, so this doesn't need `build_akida_model`'s stride-instead-of-pool
+    workaround on the input layer.
+
+    Same confirmed Akida v2 constraints apply (square kernel/stride/pool
+    every conv layer; `Conv2D -> ReLU -> GlobalAveragePooling2D` ordering
+    via `post_relu_gap=True`, not `Conv2D -> GlobalAveragePooling2D ->
+    ReLU`) — see `build_akida_model`'s docstring and module docstring for
+    where these were found. `n_bands=4` is small, so only ONE square
+    max-pool (in block2) is used — a second would collapse the band axis to
+    zero; `GlobalAveragePooling2D` in block3 handles whatever's left
+    regardless of exact size.
+
+    Returns an UNTRAINED model — train it with ordinary `.compile()`/
+    `.fit()` (class-weighted loss, real labels) before `quantize_and_convert`.
+    """
+    import tensorflow as tf
+    from akida_models.layer_blocks import conv_block, dense_block
+    from tf_keras import Model
+    from tf_keras.layers import Input, Rescaling
+
+    img_input = Input(shape=(n_bands, n_subwindows, 1), name="input", dtype=tf.uint8)
+    x = Rescaling(1.0 / 255, name="rescaling")(img_input)
+    x = conv_block(x, filters=8, kernel_size=(3, 3), name="block1",
+                    padding="same", add_batchnorm=True, strides=(1, 1))
+    x = conv_block(x, filters=16, kernel_size=(3, 3), name="block2",
+                    padding="same", add_batchnorm=True, pooling="max", pool_size=(2, 2))
+    x = conv_block(x, filters=32, kernel_size=(3, 3), name="block3",
+                    padding="same", add_batchnorm=True, pooling="global_avg",
+                    post_relu_gap=True)
+    x = dense_block(x, units=n_classes, name="predictions",
+                     add_batchnorm=False, relu_activation=False)
+    return Model(img_input, x, name="heart_akida")
 
 
 def quantize_and_convert(model, calibration_samples: np.ndarray,

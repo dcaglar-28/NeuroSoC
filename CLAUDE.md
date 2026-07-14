@@ -63,23 +63,38 @@ without waiting on Akida/MetaTF tooling access:
   measured** and will need re-characterization after porting to
   MetaTF/Akida — not assumed to carry over as-is.
 
-**Re-target onto MetaTF/Akida — IN PROGRESS, first slice done (ECG only).**
-**The Xylo fidelity gap essentially closes on this measurement**: float 0.928
-balanced acc -> Akida-sim 0.926 (5 seeds, real MIT-BIH), agreement 0.981 +/-
-0.007 -- vs. Xylo's float 0.845 -> XyloSim ~0.56 (~agreement 0.56) on the
-same task. Different architecture (quantized Conv2D CNN via quantizeml/
-cnn2snn, not an LIF SNN), so the float baselines aren't directly comparable,
-but the float->on-chip DROP -- the thing XyloSim/Akida-sim exist to measure
--- is dramatically smaller here. Caveat carried from Part 0: BrainChip does
-NOT publish an explicit bit/cycle-accurate claim for the software simulator
-the way SynSense does for XyloSim (checked 3 official sources) -- this is
+**Re-target onto MetaTF/Akida — IN PROGRESS, two modalities done (ECG, heart
+sounds).** **The Xylo fidelity gap essentially closes on BOTH measurements
+so far:**
+- ECG: float 0.928 balanced acc -> Akida-sim 0.926 (5 seeds, real MIT-BIH),
+  agreement 0.981 +/- 0.007 -- vs. Xylo's float 0.845 -> XyloSim ~0.56
+  (~agreement 0.56).
+- Heart sounds (filterbank front-end, the one that learns — raw is chance,
+  see below): float 0.865 +/- 0.020 -> Akida-sim 0.867 +/- 0.020, agreement
+  0.954 +/- 0.027 -- vs. Xylo's float 0.593 -> XyloSim 0.512, agreement
+  0.779 +/- 0.064.
+
+Different architecture each time (quantized Conv2D CNN via quantizeml/
+cnn2snn, not an LIF SNN), so the float baselines aren't directly comparable
+to Xylo's, but the float->on-chip DROP -- the thing XyloSim/Akida-sim exist
+to measure -- is dramatically smaller on Akida both times. Working
+hypothesis (strengthened, not newly proven, by the 2nd modality agreeing):
+Xylo's diagnosed root cause was per-TIMESTEP integer LIF state compounding
+error over a window; these Akida CNNs are feedforward, evaluated once per
+window, with no equivalent recurrent state to accumulate error in.
+
+Caveat carried from Part 0 (applies to both): BrainChip does NOT publish an
+explicit bit/cycle-accurate claim for the software simulator the way
+SynSense does for XyloSim (checked 3 official sources) -- this is
 "Akida-sim agreement," not a confirmed-bit-exact-to-silicon number. `akida`
 has no macOS wheel (any release, ever — Linux/Windows only), so this runs in
 a Docker container (`Dockerfile.akida`, `scripts/akida_docker_run.sh`; see
 README's "Verify on Akida"), not the host venv. See `docs/akida_ecg_results.md`
-for the full write-up: Part-0 toolchain/fidelity findings, the confirmed
-Akida v2 layer constraints, and the measured float/Akida-sim numbers vs. the
-Xylo gap. Remaining scope from `docs/akida_retarget_task.md` (other modalities, TENN,
+and `docs/akida_heart_results.md` for the full write-ups: Part-0 toolchain/
+fidelity findings, the confirmed Akida v2 layer constraints (heart sounds'
+genuinely-2-D bands x time filterbank map hit no NEW constraints beyond
+ECG's), and the measured float/Akida-sim numbers vs. the Xylo gap.
+Remaining scope from `docs/akida_retarget_task.md` (other modalities, TENN,
 on-chip-learning demo, co-residence re-eval) is not started.
 
 ## Xylo pipeline (Rockpool)

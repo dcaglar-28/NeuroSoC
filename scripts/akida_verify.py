@@ -1,20 +1,30 @@
-"""Pre-hardware acceptance check for the Akida path — ECG only, first slice
+"""Pre-hardware acceptance check for the Akida path — ECG and heart sounds
 (docs/akida_retarget_task.md). Parallels `xylo_verify.py`'s per-modality
 train -> quantize -> verify-against-sim -> footprint structure, but for
 BrainChip MetaTF (`eia.akida_models`) instead of Rockpool/XyloSim. Reuses
-`datasets.load_ecg`/`load_mitbih`, `report`, and `case_level.split_data` —
-the exact same data/split/provenance discipline as the Xylo path.
+`datasets.load_ecg`/`load_heart`, `signal_features` (heart's filterbank
+front-end), `report`, and `case_level.split_data` — the exact same
+data/split/provenance discipline as the Xylo path.
 
 **Linux only** (`akida` has no macOS wheel — see Dockerfile.akida). Run
 inside the container:
 
     scripts/akida_docker_run.sh python scripts/akida_verify.py --real --n-seeds 5
-    scripts/akida_docker_run.sh python scripts/akida_verify.py --n-seeds 2   # synthetic, quick
+    scripts/akida_docker_run.sh python scripts/akida_verify.py --n-seeds 2   # ecg, synthetic, quick
+    scripts/akida_docker_run.sh python scripts/akida_verify.py --modality heart --real --n-seeds 5
+
+Heart sounds is ALWAYS run with the filterbank front-end
+(`heart_frontend="features"`, `datasets.PCG_FEATURE_NAMES`/`PCG_BANDS`) —
+the raw waveform front-end measured flat chance on both Xylo and (see
+docs/akida_heart_results.md) the reason it isn't offered as a CLI choice
+here; there is no `--heart-frontend raw` escape hatch by design.
 
 See `src/eia/akida_models.py` for the confirmed Akida v2 layer constraints
 (square kernel/stride/pool, valid block-ordering patterns) this script's
-model relies on, and `docs/akida_ecg_results.md` for the measured results,
-the Xylo-gap comparison, and the Part-0 simulator-fidelity finding.
+models rely on, `docs/akida_ecg_results.md` for the ECG measured results,
+and `docs/akida_heart_results.md` for heart sounds' — including the
+Xylo-gap comparison and the Part-0 simulator-fidelity finding, both shared
+across modalities.
 """
 
 from __future__ import annotations
@@ -24,8 +34,8 @@ import copy
 
 import numpy as np
 
-from eia import case_level, report
-from eia.datasets import load_ecg
+from eia import case_level, report, signal_features
+from eia.datasets import load_ecg, load_heart
 
 
 def per_class_recall(preds: np.ndarray, y: np.ndarray, n_classes: int) -> list:
@@ -55,8 +65,25 @@ def _class_weight_dict(y: np.ndarray, n_classes: int) -> dict:
     return {c: float(weight[c]) for c in range(n_classes)}
 
 
-def train_and_verify(data, seed: int, epochs: int, qat_epochs: int, n_restarts: int,
-                      max_verify: int, weight_bits: int, activation_bits: int) -> dict:
+def _build_model_for(modality: str, data_shape: tuple, n_classes: int):
+    """Dispatch to the right `eia.akida_models` builder. `data_shape` is
+    `Xtr.shape[1:]` -- `(window,)` for ecg, `(n_features, n_subwindows)` for
+    heart (post-split, pre-`to_akida_input`, matching `HeartData.X`'s
+    `(n, n_features, n_subwindows)` convention)."""
+    from eia import akida_models as am
+
+    if modality == "ecg":
+        return am.build_akida_model(window=data_shape[0], n_classes=n_classes)
+    if modality == "heart":
+        n_features, n_subwindows = data_shape
+        return am.build_akida_heart_model(
+            n_bands=n_features, n_subwindows=n_subwindows, n_classes=n_classes)
+    raise ValueError(f"unknown modality {modality!r}")
+
+
+def train_and_verify(data, modality: str, seed: int, epochs: int, qat_epochs: int,
+                      n_restarts: int, max_verify: int, weight_bits: int,
+                      activation_bits: int) -> dict:
     """Train (float) -> quantize+QAT-fine-tune -> convert -> verify-against-
     Akida-sim for one seed. Restarts pick the best VAL balanced accuracy
     float checkpoint (mirrors `xylo_verify.train_modality`'s restart logic —
@@ -69,21 +96,48 @@ def train_and_verify(data, seed: int, epochs: int, qat_epochs: int, n_restarts: 
     from eia import akida_models as am
 
     card = report.data_card(data, verbose=(seed == 0))
-    report.assert_provenance(card, data, "ecg")
+    report.assert_provenance(card, data, modality)
     n_classes = int(np.asarray(data.y).max()) + 1
 
+    if modality == "heart" and getattr(data, "frontend", "raw") != "features":
+        # A real, documented gap, not a bug to silently paper over: the
+        # synthetic heart-sound fallback (`make_synthetic_heart`) is always
+        # raw-waveform-shaped (`(n, window)`), but `build_akida_heart_model`
+        # only supports the filterbank shape (raw is banned for heart here
+        # anyway -- it measured flat chance, see docs/heart_sounds_results.md).
+        # This only bites when real CinC 2016 fails to load and silently
+        # falls back to synthetic (`--real` without `--require-real`); use
+        # `--require-real` to fail loudly instead, or pass `--real` with
+        # working network access.
+        raise RuntimeError(
+            f"heart Akida path requires the filterbank front-end "
+            f"(data.frontend='features'), got {data.frontend!r} -- "
+            "make_synthetic_heart() (the real-data fallback) is raw-only "
+            "and unsupported here. Pass --real (needs network) or "
+            "--require-real to fail loudly instead of silently falling "
+            "back to an unusable synthetic shape.")
+
     Xtr, Xval, Xte, ytr, yval, yte, _gtr, _gval, _gte = case_level.split_data(data, seed)
+
+    # Heart's filterbank front-end: X holds RAW feature values out of the
+    # loader (line length, band power, spectral entropy are on wildly
+    # different scales) — z-score fit on Xtr ONLY, applied to Xval/Xte, here
+    # (post-split, not in the loader) so val/test statistics can't leak into
+    # training. Exact same call as `xylo_verify.py`'s heart path.
+    if getattr(data, "frontend", "raw") == "features":
+        Xtr, Xval, Xte = signal_features.normalize_features_train_only(Xtr, Xval, Xte)
+
     Xtr_u8 = am.to_akida_input(Xtr)
     Xval_u8 = am.to_akida_input(Xval)
     Xte_u8 = am.to_akida_input(Xte)
     class_weight = _class_weight_dict(ytr, n_classes)
-    print(f"[train] ecg(akida): class weights = {class_weight}")
+    print(f"[train] {modality}(akida): class weights = {class_weight}")
 
-    window = Xtr.shape[-1]
+    data_shape = Xtr.shape[1:]
     best_val_bal_acc, best_weights = -1.0, None
     for restart in range(n_restarts):
         tf.random.set_seed(seed * 100 + restart)
-        model = am.build_akida_model(window=window, n_classes=n_classes)
+        model = _build_model_for(modality, data_shape, n_classes)
         model.compile(
             optimizer="adam",
             loss=tf_keras.losses.SparseCategoricalCrossentropy(from_logits=True),
@@ -92,18 +146,18 @@ def train_and_verify(data, seed: int, epochs: int, qat_epochs: int, n_restarts: 
                   verbose=0)
         val_preds = np.asarray(model.predict(Xval_u8, verbose=0)).argmax(axis=-1)
         val_bal_acc = balanced_accuracy(val_preds, yval, n_classes)
-        print(f"[train] ecg(akida) restart {restart}: val balanced accuracy = {val_bal_acc:.3f}")
+        print(f"[train] {modality}(akida) restart {restart}: val balanced accuracy = {val_bal_acc:.3f}")
         if val_bal_acc > best_val_bal_acc:
             best_val_bal_acc = val_bal_acc
             best_weights = copy.deepcopy(model.get_weights())
 
-    model = am.build_akida_model(window=window, n_classes=n_classes)
+    model = _build_model_for(modality, data_shape, n_classes)
     model.set_weights(best_weights)
     model.compile(
         optimizer="adam",
         loss=tf_keras.losses.SparseCategoricalCrossentropy(from_logits=True),
         metrics=["accuracy"])
-    print(f"[train] ecg(akida): final best val balanced accuracy = {best_val_bal_acc:.3f}")
+    print(f"[train] {modality}(akida): final best val balanced accuracy = {best_val_bal_acc:.3f}")
 
     float_logits = np.asarray(model.predict(Xte_u8, verbose=0))
     float_preds = float_logits.argmax(axis=-1)
@@ -147,15 +201,17 @@ def train_and_verify(data, seed: int, epochs: int, qat_epochs: int, n_restarts: 
         # `akida_model.summary()`). No hard channel/neuron BUDGET check here
         # unlike Xylo's xylo_budget.py -- Akida 2.0's mesh sizing constraints
         # weren't investigated in this first slice (out of scope, see
-        # docs/akida_ecg_results.md "What this does NOT show").
-        "footprint_input_shape": (window, 1, 1),
+        # docs/akida_ecg_results.md/docs/akida_heart_results.md "What this
+        # does NOT show").
+        "modality": modality,
+        "footprint_input_shape": Xtr_u8.shape[1:],
         "footprint_output_shape": (n_classes,),
         "footprint_n_akida_layers": len(akida_model.layers),
     }
 
 
 def print_result(r: dict) -> None:
-    header = f" AKIDA VERIFICATION -- ECG ({r['source']}) "
+    header = f" AKIDA VERIFICATION -- {r['modality'].upper()} ({r['source']}) "
     print(f"\n{header:=^60}")
     print(f"Provenance                : {r['provenance']}")
     print(f"Samples (dataset / verify): {r['n_samples']} / {r['n_verify']}")
@@ -187,7 +243,8 @@ def print_multiseed_summary(results: list) -> None:
     fr_m, fr_s = _stat_recalls("float_recalls")
     xr_m, xr_s = _stat_recalls("akida_recalls")
 
-    print(f"\n{' MULTI-SEED SUMMARY -- ECG (AKIDA) ':=^60}")
+    modality = results[0]["modality"]
+    print(f"\n{f' MULTI-SEED SUMMARY -- {modality.upper()} (AKIDA) ':=^60}")
     print(f"n_seeds                  : {len(results)}")
     print(f"Float balanced acc       : {fb[0]:.3f} +/- {fb[1]:.3f}")
     print(f"Float AUROC              : {auroc[0]:.3f} +/- {auroc[1]:.3f}")
@@ -198,9 +255,23 @@ def print_multiseed_summary(results: list) -> None:
     print("=" * 60)
 
 
+def _load_data(modality: str, real: bool, require_real: bool):
+    if modality == "ecg":
+        return load_ecg(prefer_real=real, require_real=require_real)
+    if modality == "heart":
+        # ALWAYS the filterbank front-end -- raw delta measured flat chance
+        # on both Xylo and Akida-CNN-relevant inputs (see
+        # docs/heart_sounds_results.md); no CLI escape hatch to "raw" here.
+        return load_heart(prefer_real=real, require_real=require_real,
+                           heart_frontend="features")
+    raise ValueError(f"unknown modality {modality!r}")
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Akida ECG verification (first slice)")
-    ap.add_argument("--real", action="store_true", help="use real MIT-BIH (needs wfdb + network)")
+    ap = argparse.ArgumentParser(description="Akida verification (ECG / heart sounds)")
+    ap.add_argument("--modality", choices=["ecg", "heart"], default="ecg")
+    ap.add_argument("--real", action="store_true",
+                     help="use real data (MIT-BIH for ecg, CinC 2016 for heart) — needs network")
     ap.add_argument("--require-real", action="store_true")
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--qat-epochs", type=int, default=5,
@@ -216,11 +287,12 @@ def main():
 
     results = []
     for s in range(n_seeds):
-        data = load_ecg(prefer_real=real, require_real=args.require_real)
+        data = _load_data(args.modality, real, args.require_real)
         r = train_and_verify(
-            data, seed=s, epochs=args.epochs, qat_epochs=args.qat_epochs,
-            n_restarts=args.n_restarts, max_verify=args.max_verify,
-            weight_bits=args.weight_bits, activation_bits=args.activation_bits)
+            data, modality=args.modality, seed=s, epochs=args.epochs,
+            qat_epochs=args.qat_epochs, n_restarts=args.n_restarts,
+            max_verify=args.max_verify, weight_bits=args.weight_bits,
+            activation_bits=args.activation_bits)
         print_result(r)
         results.append(r)
 

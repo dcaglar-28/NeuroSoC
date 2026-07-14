@@ -47,11 +47,63 @@ def test_to_akida_input_per_window_normalization():
     assert out[1].min() == 0 and out[1].max() == 255
 
 
+def test_to_akida_input_3d_shape_and_dtype():
+    # Heart's filterbank map: (n, n_features, n_subwindows) -> (n, H, W, 1).
+    X = np.random.default_rng(0).normal(size=(5, 4, 24)).astype("float32")
+    out = am.to_akida_input(X)
+    assert out.shape == (5, 4, 24, 1)
+    assert out.dtype == np.uint8
+
+
+def test_to_akida_input_3d_normalizes_per_row_not_per_sample():
+    # Row 0 (e.g. line_length, large raw scale) and row 1 (e.g. a [0,1]
+    # band-power fraction) should each independently span [0, 255] --
+    # confirms the per-row (per-feature-channel), not whole-sample, min-max.
+    X = np.zeros((1, 2, 8))
+    X[0, 0] = np.linspace(1000.0, 2000.0, 8)   # a "large-scale" feature row
+    X[0, 1] = np.linspace(0.0, 1.0, 8)          # a "[0,1]-scale" feature row
+    out = am.to_akida_input(X)
+    assert out[0, 0].min() == 0 and out[0, 0].max() == 255
+    assert out[0, 1].min() == 0 and out[0, 1].max() == 255
+
+
 def test_build_akida_model_shapes():
     pytest.importorskip("akida")
     model = am.build_akida_model(window=187, n_classes=2)
     assert model.input_shape == (None, 187, 1, 1)
     assert model.output_shape == (None, 2)
+
+
+def test_build_akida_heart_model_shapes():
+    pytest.importorskip("akida")
+    model = am.build_akida_heart_model(n_bands=4, n_subwindows=24, n_classes=2)
+    assert model.input_shape == (None, 4, 24, 1)
+    assert model.output_shape == (None, 2)
+
+
+def test_heart_quantize_and_convert_and_verify_roundtrip():
+    """Same smoke test as ECG's, for the heart model + its 2-D (bands x
+    time) input -- confirms the Akida v2 conversion constraints
+    (square kernel/stride/pool, valid layer ordering) also hold for this
+    genuinely-2-D input shape, not just ECG's single-column one."""
+    pytest.importorskip("akida")
+    import tf_keras
+
+    rng = np.random.default_rng(0)
+    X = am.to_akida_input(rng.normal(size=(32, 4, 24)).astype("float32"))
+    y = rng.integers(0, 2, size=32)
+
+    model = am.build_akida_heart_model(n_bands=4, n_subwindows=24, n_classes=2)
+    model.compile(optimizer="adam",
+                   loss=tf_keras.losses.SparseCategoricalCrossentropy(from_logits=True))
+    model.fit(X, y, epochs=1, batch_size=16, verbose=0)
+
+    _qmodel, akida_model = am.quantize_and_convert(model, X[:16], num_samples=16, batch_size=8)
+    res = am.verify_against_sim(model, akida_model, X[:8])
+
+    assert res["pred_float"].shape == (8,)
+    assert res["pred_akida"].shape == (8,)
+    assert 0.0 <= res["agreement_rate"] <= 1.0
 
 
 def test_quantize_and_convert_and_verify_roundtrip():
