@@ -1,10 +1,11 @@
-"""Pre-hardware acceptance check for the Akida path — ECG and heart sounds
-(docs/akida_retarget_task.md). Parallels `xylo_verify.py`'s per-modality
-train -> quantize -> verify-against-sim -> footprint structure, but for
-BrainChip MetaTF (`eia.akida_models`) instead of Rockpool/XyloSim. Reuses
-`datasets.load_ecg`/`load_heart`, `signal_features` (heart's filterbank
-front-end), `report`, and `case_level.split_data` — the exact same
-data/split/provenance discipline as the Xylo path.
+"""Pre-hardware acceptance check for the Akida path — ECG, heart sounds, and
+the synthetic CRM/occult-hemorrhage demo (docs/akida_retarget_task.md,
+docs/synthetic_crm_task.md). Parallels `xylo_verify.py`'s per-modality train
+-> quantize -> verify-against-sim -> footprint structure, but for BrainChip
+MetaTF (`eia.akida_models`) instead of Rockpool/XyloSim. Reuses
+`datasets.load_ecg`/`load_heart`/`load_crm`, `signal_features` (heart's
+filterbank front-end), `report`, and `case_level.split_data` — the exact
+same data/split/provenance discipline as the Xylo path.
 
 **Linux only** (`akida` has no macOS wheel — see Dockerfile.akida). Run
 inside the container:
@@ -12,19 +13,26 @@ inside the container:
     scripts/akida_docker_run.sh python scripts/akida_verify.py --real --n-seeds 5
     scripts/akida_docker_run.sh python scripts/akida_verify.py --n-seeds 2   # ecg, synthetic, quick
     scripts/akida_docker_run.sh python scripts/akida_verify.py --modality heart --real --n-seeds 5
+    scripts/akida_docker_run.sh python scripts/akida_verify.py --modality crm --n-seeds 5
 
 Heart sounds is ALWAYS run with the filterbank front-end
 (`heart_frontend="features"`, `datasets.PCG_FEATURE_NAMES`/`PCG_BANDS`) —
 the raw waveform front-end measured flat chance on both Xylo and (see
 docs/akida_heart_results.md) the reason it isn't offered as a CLI choice
-here; there is no `--heart-frontend raw` escape hatch by design.
+here; there is no `--heart-frontend raw` escape hatch by design. CRM is
+ALWAYS synthetic (`--real`/`--require-real` are accepted for CLI symmetry
+but `load_crm` has no real branch — see its docstring) and ALWAYS uses the
+ECG-style raw-waveform front-end (`build_akida_model`, reused unchanged),
+NOT heart's filterbank — CRM is a low-frequency pulse-MORPHOLOGY signal,
+not a spectral one; see docs/synthetic_crm_results.md.
 
 See `src/eia/akida_models.py` for the confirmed Akida v2 layer constraints
 (square kernel/stride/pool, valid block-ordering patterns) this script's
 models rely on, `docs/akida_ecg_results.md` for the ECG measured results,
-and `docs/akida_heart_results.md` for heart sounds' — including the
-Xylo-gap comparison and the Part-0 simulator-fidelity finding, both shared
-across modalities.
+`docs/akida_heart_results.md` for heart sounds', and
+`docs/synthetic_crm_results.md` for the CRM demo's — including the Xylo-gap
+comparison and the Part-0 simulator-fidelity finding, shared across
+modalities, and (CRM only) the explicit synthetic/non-clinical caveat.
 """
 
 from __future__ import annotations
@@ -35,7 +43,7 @@ import copy
 import numpy as np
 
 from eia import case_level, report, signal_features
-from eia.datasets import load_ecg, load_heart
+from eia.datasets import load_crm, load_ecg, load_heart
 
 
 def per_class_recall(preds: np.ndarray, y: np.ndarray, n_classes: int) -> list:
@@ -67,12 +75,15 @@ def _class_weight_dict(y: np.ndarray, n_classes: int) -> dict:
 
 def _build_model_for(modality: str, data_shape: tuple, n_classes: int):
     """Dispatch to the right `eia.akida_models` builder. `data_shape` is
-    `Xtr.shape[1:]` -- `(window,)` for ecg, `(n_features, n_subwindows)` for
-    heart (post-split, pre-`to_akida_input`, matching `HeartData.X`'s
-    `(n, n_features, n_subwindows)` convention)."""
+    `Xtr.shape[1:]` -- `(window,)` for ecg AND crm (crm reuses
+    `build_akida_model`'s waveform-over-time architecture unchanged: CRM is
+    a low-frequency pulse-MORPHOLOGY signal, the same class of input ECG's
+    architecture was built for, not heart's spectral filterbank map),
+    `(n_features, n_subwindows)` for heart (post-split, pre-`to_akida_input`,
+    matching `HeartData.X`'s `(n, n_features, n_subwindows)` convention)."""
     from eia import akida_models as am
 
-    if modality == "ecg":
+    if modality in ("ecg", "crm"):
         return am.build_akida_model(window=data_shape[0], n_classes=n_classes)
     if modality == "heart":
         n_features, n_subwindows = data_shape
@@ -264,14 +275,21 @@ def _load_data(modality: str, real: bool, require_real: bool):
         # docs/heart_sounds_results.md); no CLI escape hatch to "raw" here.
         return load_heart(prefer_real=real, require_real=require_real,
                            heart_frontend="features")
+    if modality == "crm":
+        # ALWAYS synthetic -- load_crm has no real branch (real LBNP/CRM-
+        # induction data is gated, see docs/synthetic_crm_task.md); --real
+        # is accepted for CLI symmetry (recorded honestly in
+        # `requested_real`) and --require-real raises immediately.
+        return load_crm(prefer_real=real, require_real=require_real)
     raise ValueError(f"unknown modality {modality!r}")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Akida verification (ECG / heart sounds)")
-    ap.add_argument("--modality", choices=["ecg", "heart"], default="ecg")
+    ap = argparse.ArgumentParser(description="Akida verification (ECG / heart sounds / CRM)")
+    ap.add_argument("--modality", choices=["ecg", "heart", "crm"], default="ecg")
     ap.add_argument("--real", action="store_true",
-                     help="use real data (MIT-BIH for ecg, CinC 2016 for heart) — needs network")
+                     help="use real data (MIT-BIH for ecg, CinC 2016 for heart) — needs "
+                          "network. No effect for crm (always synthetic).")
     ap.add_argument("--require-real", action="store_true")
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--qat-epochs", type=int, default=5,

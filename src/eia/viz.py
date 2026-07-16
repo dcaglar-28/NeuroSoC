@@ -100,3 +100,73 @@ def plot_class_balance(data):
     ax.set_title(f"class balance [{getattr(data, 'source', '')}]")
     fig.tight_layout()
     return fig
+
+
+def plot_crm_lead_effect(windows_per_subject: int = 24, hr_baseline: float = 70.0,
+                          window_sec: float = 3.0, fs: float = 100.0, seed: int = 0):
+    """Demonstrate the CRM "lead effect" (docs/synthetic_crm_task.md) on one
+    synthetic subject's trajectory: pulse MORPHOLOGY degrades from the very
+    start of the decline, while heart rate stays flat at baseline until
+    reserve drops well below the "compromised" label threshold — i.e. a
+    classifier tracking morphology alone can flag the compromise before a
+    pulse check (HR) would show anything unusual.
+
+    Top row: three example windows (early/mid/late on the trajectory) —
+    amplitude drop and dicrotic-notch blunting are visible by eye. Bottom
+    panel: reserve `r(t)` and heart rate `HR(t)` over the trajectory, with
+    the "occult" band (`_HR_RISE_R < r <= CRI_THRESHOLD` — labelled
+    compromised, HR still at baseline) shaded.
+
+    Returns a matplotlib Figure (same convention as this module's other
+    plots — `fig.savefig(...)` to export, e.g. for docs/synthetic_crm_results.md).
+    """
+    import matplotlib.pyplot as plt
+
+    from . import datasets
+
+    rng = np.random.default_rng(seed)
+    r_traj = datasets._reserve_trajectory(windows_per_subject, rng)
+    hr_traj = datasets._hr_from_r(r_traj, hr_baseline)
+    windows = [
+        datasets._crm_window(float(r), float(hr), window_sec, fs, rng, 1.0, 1.0, noise=0.02)
+        for r, hr in zip(r_traj, hr_traj)
+    ]
+
+    fig = plt.figure(figsize=(11, 6))
+    gs = fig.add_gridspec(2, 3, height_ratios=[1, 1.3])
+    t_wave = np.arange(windows[0].size) / fs
+
+    snapshot_idx = [0, windows_per_subject // 2, windows_per_subject - 1]
+    for col, i in enumerate(snapshot_idx):
+        ax = fig.add_subplot(gs[0, col])
+        ax.plot(t_wave, windows[i], lw=1, color="tab:blue")
+        ax.set_title(f"window {i}  (r={r_traj[i]:.2f}, HR={hr_traj[i]:.0f} bpm)")
+        ax.set_xlabel("time (s)")
+        if col == 0:
+            ax.set_ylabel("PPG (a.u.)")
+
+    ax2 = fig.add_subplot(gs[1, :])
+    step = np.arange(windows_per_subject)
+    occult = (r_traj > datasets._HR_RISE_R) & (r_traj <= datasets.CRI_THRESHOLD)
+    if occult.any():
+        first, last = np.where(occult)[0][[0, -1]]
+        ax2.axvspan(first, last, color="tab:red", alpha=0.12,
+                     label="occult band: labelled compromised, HR still baseline")
+
+    ax2r = ax2.twinx()
+    ax2.plot(step, r_traj, color="tab:green", lw=2, label="reserve r(t)")
+    ax2.axhline(datasets.CRI_THRESHOLD, color="tab:green", ls="--", lw=1, alpha=0.6,
+                 label=f"CRI threshold ({datasets.CRI_THRESHOLD})")
+    ax2r.plot(step, hr_traj, color="tab:purple", lw=2, label="heart rate (bpm)")
+    ax2.set_xlabel("window index (time along trajectory)")
+    ax2.set_ylabel("reserve r", color="tab:green")
+    ax2r.set_ylabel("heart rate (bpm)", color="tab:purple")
+
+    lines1, labels1 = ax2.get_legend_handles_labels()
+    lines2, labels2 = ax2r.get_legend_handles_labels()
+    ax2.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=8)
+    ax2.set_title("Morphology (reserve-driven) declines well before heart rate moves")
+
+    fig.suptitle("Synthetic CRM trajectory — the morphology-leads-HR effect")
+    fig.tight_layout()
+    return fig

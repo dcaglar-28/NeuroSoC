@@ -148,3 +148,31 @@ def test_quantize_and_convert_qat_fine_tune_runs():
         model, X[:16], num_samples=16, batch_size=8, qat_epochs=1, qat_X=X, qat_y=y)
     out = akida_model.forward(X[:4])
     assert out.shape[0] == 4
+
+
+def test_crm_reuses_build_akida_model_unchanged_end_to_end():
+    """CRM does NOT get its own builder (docs/synthetic_crm_task.md: reuse
+    the ECG waveform -> Akida CNN path, not heart's filterbank) -- this
+    confirms `build_akida_model` (unmodified) converts and runs on the
+    real `make_synthetic_crm` data shape, end to end."""
+    pytest.importorskip("akida")
+    import tf_keras
+
+    from eia.datasets import make_synthetic_crm
+
+    d = make_synthetic_crm(n_subjects=3, windows_per_subject=8, window_sec=1.0,
+                            fs=50.0, seed=0)
+    X = am.to_akida_input(d.X)
+    y = d.y
+
+    model = am.build_akida_model(window=d.X.shape[1], n_classes=2)
+    assert model.input_shape == (None, d.X.shape[1], 1, 1)
+    model.compile(optimizer="adam",
+                   loss=tf_keras.losses.SparseCategoricalCrossentropy(from_logits=True))
+    model.fit(X, y, epochs=1, batch_size=8, verbose=0)
+
+    _qmodel, akida_model = am.quantize_and_convert(model, X[:12], num_samples=12, batch_size=8)
+    res = am.verify_against_sim(model, akida_model, X[:8])
+    assert res["pred_float"].shape == (8,)
+    assert res["pred_akida"].shape == (8,)
+    assert 0.0 <= res["agreement_rate"] <= 1.0

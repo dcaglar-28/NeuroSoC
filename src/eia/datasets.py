@@ -76,6 +76,39 @@ class PpgData:
     groups: np.ndarray | None = None
 
 
+@dataclass
+class CrmData:
+    """A synthetic, TIME-RESOLVED Compensatory Reserve trajectory dataset —
+    see docs/synthetic_crm_task.md. Same 2-D (n_samples, window) PPG-shaped
+    convention as `PpgData` (deliberately its own dataclass, not a reuse of
+    `PpgData`, only because it needs one extra field, `cri`, that no other
+    PPG source has: the continuous ground-truth reserve value, not just the
+    thresholded binary label — see `cri` below)."""
+    X: np.ndarray  # (n_samples, window) float32 — multi-pulse PPG windows
+    y: np.ndarray   # (n_samples,) int64 — 0 = reserve intact (cri >= threshold),
+                     # 1 = compromised (cri < threshold); see `cri`.
+    fs: float       # sampling rate (Hz)
+    source: str     # "synthetic" ONLY — no real loader exists (real LBNP/
+                     # CRM-induction data is gated; see
+                     # docs/synthetic_crm_task.md). Never claim this is a
+                     # clinical accuracy number — see `report._CARDS`.
+    requested_real: bool = False
+    # Synthetic SUBJECT id per window — ALWAYS set (unlike other synthetic
+    # generators, which have no natural grouping): many highly-correlated
+    # windows come from one subject's hypovolemia TRAJECTORY, so splitting
+    # must be subject-grouped (`case_level.split_data`), never by window.
+    groups: np.ndarray | None = None
+    # (n_samples,) float32 in [0, 1] — the CONTINUOUS reserve fraction r(t)
+    # AT THIS WINDOW'S EXACT POINT on its trajectory (1.0 = full reserve,
+    # 0.0 = decompensated). `y` is `cri < threshold` thresholded from this.
+    # This is the field that makes the label genuinely TIME-ALIGNED, unlike
+    # VitalDB's one-whole-case-EBL-number-stamped-on-every-window flaw this
+    # generator exists to fix — kept for unit-testing the alignment
+    # property directly and as the target for a future CRI-regression
+    # variant (not built here, see docs/synthetic_crm_task.md).
+    cri: np.ndarray | None = None
+
+
 # --------------------------------------------------------------------------- #
 # Synthetic generator
 # --------------------------------------------------------------------------- #
@@ -972,6 +1005,221 @@ def load_ppg_vitaldb(prefer_real: bool = True, require_real: bool = False,
                 ) from e
             print(f"[warn] real VitalDB PPG unavailable ({e}); falling back to synthetic PPG.")
     data = make_synthetic_ppg()
+    data.requested_real = prefer_real
+    return data
+
+
+# --------------------------------------------------------------------------- #
+# CRM — synthetic time-resolved Compensatory Reserve / occult-hemorrhage
+# generator (docs/synthetic_crm_task.md)
+# --------------------------------------------------------------------------- #
+# Why this exists: VitalDB settled ~chance because one whole-CASE
+# `intraop_ebl` number was stamped on every window regardless of when in the
+# case it was captured (see docs/vitaldb_case_level_results.md) — the label
+# never matched the window's actual physiological state. This generator
+# fixes that BY CONSTRUCTION: each window is labelled with the reserve
+# fraction at its own exact point on a simulated hypovolemia trajectory, so
+# it is a genuine (if synthetic) test of whether the pipeline can track
+# time-varying occult volume loss, not just classify a fixed waveform shape.
+#
+# Physiological grounding (see docs/synthetic_crm_task.md and the
+# explainable-CRM paper, MDPI Bioengineering 2023, "An Explainable Machine
+# Learning Model for the Assessment of Compensatory Reserve"): as central
+# reserve `r` falls from 1.0 (normovolemic) toward 0.0 (decompensated),
+# PPG pulse amplitude drops, the dicrotic notch (the paper's most
+# discriminative CRM feature) blunts and then disappears, the systolic
+# upstroke narrows, and the diastolic/reflected-wave component flattens —
+# all BEFORE heart rate rises (compensatory tachycardia only engages once
+# reserve is significantly depleted). That morphology-leads-vitals ordering
+# is the entire clinical value proposition CRM demonstrates and is deliberately
+# reproduced here: see `_HR_RISE_R` < `CRI_THRESHOLD` below.
+CRI_THRESHOLD = 0.5   # default binary label boundary: cri < this = "compromised"
+_HR_RISE_R = 0.30      # HR starts rising only BELOW this r -- deliberately
+                        # LOWER than CRI_THRESHOLD, so the r in (0.30, 0.50]
+                        # band is labelled "compromised" (y=1) while HR is
+                        # STILL AT BASELINE — the occult/pre-vitals-change
+                        # detection window the whole generator exists to test.
+_HR_COLLAPSE_R = 0.10  # below this, HR falls back toward a low terminal
+                        # value (decompensation), rather than continuing to rise.
+
+
+def _reserve_trajectory(n_windows: int, rng: np.random.Generator) -> np.ndarray:
+    """Reserve fraction r(t) in [0, 1] for one synthetic subject's
+    trajectory: 1.0 (full reserve) declining to 0.0 (decompensated) over
+    `n_windows` steps. Monotonically NON-INCREASING by construction (no
+    noise added to `r` itself — all randomness lives in the pulse signal
+    and the per-subject baseline parameters, not the trajectory), so this
+    is exactly and cheaply unit-testable. `shape` (per-subject, randomized)
+    varies whether the decline front-loads or back-loads, so the pipeline
+    can't memorize one fixed trajectory curve.
+    """
+    shape = rng.uniform(0.7, 1.8)
+    t = np.linspace(0.0, 1.0, n_windows)
+    return np.clip(1.0 - t ** shape, 0.0, 1.0)
+
+
+def _hr_from_r(r, hr_baseline: float) -> np.ndarray:
+    """Heart rate (bpm) as a function of reserve `r` — flat at
+    `hr_baseline` while `r > _HR_RISE_R` (this flat zone is what makes the
+    morphology-leads-HR demonstration possible), rising toward a
+    compensatory-tachycardia peak as `r` falls through
+    (`_HR_COLLAPSE_R`, `_HR_RISE_R`], then falling back toward a low
+    terminal value below `_HR_COLLAPSE_R` (decompensation/collapse, not
+    sustained tachycardia at r=0)."""
+    r = np.asarray(r, dtype=np.float64)
+    tachy_peak = hr_baseline * 1.6
+    terminal = hr_baseline * 0.6
+    rising = hr_baseline + (tachy_peak - hr_baseline) * (
+        (_HR_RISE_R - r) / (_HR_RISE_R - _HR_COLLAPSE_R))
+    collapsing = terminal + (tachy_peak - terminal) * (r / _HR_COLLAPSE_R)
+    return np.where(r > _HR_RISE_R, hr_baseline, np.where(r > _HR_COLLAPSE_R, rising, collapsing))
+
+
+def _crm_pulse(r: float, n: int, rng: np.random.Generator,
+                amp_scale: float = 1.0, width_scale: float = 1.0) -> np.ndarray:
+    """One PPG pulse cycle at reserve state `r` in [0, 1], `n` samples long.
+    Continuously interpolates the same qualitative endpoints
+    `_normal_pulse` (r=1)/`_hypovolemic_pulse` (r=0) already encode, as a
+    function of `r` rather than a hard binary switch — amplitude and the
+    diastolic component scale down smoothly, the pulse narrows, and the
+    dicrotic notch (`notch_amp`) is the STRONGEST cue: it has the widest
+    proportional range, -> ~0 as r -> 0, matching the CRM literature's
+    finding that notch morphology is the most discriminative single feature.
+    """
+    t = np.linspace(0, 1, n)
+    jitter = rng.normal(0, 0.01)
+    amp = amp_scale * (0.35 + 0.65 * r)
+    width = 0.055 * width_scale * (0.65 + 0.35 * r)
+    notch_amp = 0.15 * r
+    diastolic_amp = 0.35 * (0.20 + 0.80 * r)
+    return (
+        _gaussian(t, 0.28 + jitter, width, amp)
+        + _gaussian(t, 0.55, 0.030, notch_amp)
+        + _gaussian(t, 0.62, 0.070, diastolic_amp)
+    )
+
+
+def _crm_window(r: float, hr_bpm: float, window_sec: float, fs: float,
+                 rng: np.random.Generator, amp_scale: float, width_scale: float,
+                 noise: float) -> np.ndarray:
+    """Build one fixed-duration window at reserve state `r` / heart rate
+    `hr_bpm`: tile individual `_crm_pulse` cycles back-to-back, spaced by
+    the CURRENT inter-beat interval (60/hr_bpm seconds) — so both pulse
+    MORPHOLOGY (shape, via `r`) and pulse-to-pulse SPACING (apparent HR,
+    via `hr_bpm`) are visible within one window, exactly like a real
+    fixed-duration PPG capture. This is what lets a window from the
+    r in (_HR_RISE_R, CRI_THRESHOLD] "occult" band show degraded morphology
+    at a still-baseline pulse spacing — the lead effect.
+    """
+    n_total = int(round(window_sec * fs))
+    ibi_samples = max(4, int(round(fs * 60.0 / hr_bpm)))
+    sig = np.zeros(n_total, dtype=np.float64)
+    onset = 0
+    while onset < n_total:
+        pulse_len = min(ibi_samples, n_total - onset)
+        if pulse_len < 4:
+            break
+        sig[onset:onset + pulse_len] += _crm_pulse(
+            r, ibi_samples, rng, amp_scale, width_scale)[:pulse_len]
+        onset += ibi_samples
+    sig = sig + rng.normal(0, noise, size=n_total)
+    return sig.astype(np.float32)
+
+
+def make_synthetic_crm(
+    n_subjects: int = 50,
+    windows_per_subject: int = 24,
+    window_sec: float = 3.0,
+    fs: float = 100.0,
+    cri_threshold: float = CRI_THRESHOLD,
+    hr_baseline_range: tuple = (60.0, 80.0),
+    amp_scale_range: tuple = (0.8, 1.2),
+    width_scale_range: tuple = (0.85, 1.15),
+    noise: float = 0.03,
+    seed: int = 0,
+) -> CrmData:
+    """Generate the synthetic time-resolved CRM / occult-hemorrhage
+    dataset: `n_subjects` independent hypovolemia trajectories, each
+    contributing `windows_per_subject` time-aligned windows.
+
+    Each subject gets its own randomized baseline heart rate, pulse
+    amplitude/width scale, and trajectory decline shape (`_reserve_trajectory`)
+    — so the model can't memorize one fixed waveform or one fixed
+    trajectory curve; it has to track the r-dependent morphology/HR
+    relationships themselves.
+
+    Args:
+        n_subjects: number of independent synthetic trajectories.
+        windows_per_subject: windows sampled along each trajectory
+            (evenly spaced from r=1 to r=0 — see `_reserve_trajectory`).
+        window_sec/fs: capture duration and sample rate per window
+            (window = `round(window_sec * fs)` samples).
+        cri_threshold: binary label boundary — `y = 1` iff `cri < threshold`.
+            Deliberately ABOVE `_HR_RISE_R` (0.30), so some windows in every
+            trajectory are labelled positive while HR is still at baseline —
+            the "detect before vitals move" property this generator exists
+            to demonstrate (see module-level comment above).
+        hr_baseline_range/amp_scale_range/width_scale_range: per-subject
+            randomization ranges for baseline HR and pulse morphology scale.
+        noise: additive Gaussian noise std on the final signal.
+        seed: RNG seed (subject cohort + per-subject/per-window randomness).
+
+    Returns:
+        CrmData with `source="synthetic"`, `groups` = subject id per window
+        (ALWAYS set — split by subject, never by window), and `cri` = the
+        continuous reserve value each window's `y` was thresholded from.
+    """
+    rng = np.random.default_rng(seed)
+    X_list, y_list, group_list, cri_list = [], [], [], []
+    for subj in range(n_subjects):
+        subj_rng = np.random.default_rng(rng.integers(0, 2**31 - 1))
+        hr_baseline = subj_rng.uniform(*hr_baseline_range)
+        amp_scale = subj_rng.uniform(*amp_scale_range)
+        width_scale = subj_rng.uniform(*width_scale_range)
+        r_traj = _reserve_trajectory(windows_per_subject, subj_rng)
+        for w in range(windows_per_subject):
+            r = float(r_traj[w])
+            hr = float(_hr_from_r(r, hr_baseline))
+            sig = _crm_window(r, hr, window_sec, fs, subj_rng, amp_scale, width_scale, noise)
+            X_list.append(sig)
+            y_list.append(1 if r < cri_threshold else 0)
+            group_list.append(subj)
+            cri_list.append(r)
+
+    return CrmData(
+        X=np.stack(X_list).astype(np.float32),
+        y=np.array(y_list, dtype=np.int64),
+        fs=fs, source="synthetic",
+        groups=np.array(group_list, dtype=np.int64),
+        cri=np.array(cri_list, dtype=np.float32),
+    )
+
+
+def load_crm(prefer_real: bool = False, require_real: bool = False,
+             **kwargs) -> CrmData:
+    """Load the synthetic time-resolved CRM dataset. ALWAYS synthetic —
+    there is no real loader: real LBNP/CRM-induction data is gated (request
+    access separately; see docs/synthetic_crm_task.md). Mirrors the other
+    loaders' provenance-contract SHAPE for API consistency (`requested_real`
+    recorded honestly, `require_real` raises rather than silently
+    substituting), even though there is no real branch to fall back FROM.
+
+    Args:
+        prefer_real: accepted for API symmetry; has no effect except being
+            recorded in `requested_real` (so a caller that asked for real
+            data can see, from the data card, that it silently got
+            synthetic instead — this loader has nothing else to warn about).
+        require_real: if True, raises immediately (real data genuinely does
+            not exist in this repo) rather than pretending synthetic is real.
+        **kwargs: forwarded to `make_synthetic_crm`.
+    """
+    if require_real:
+        raise RuntimeError(
+            "--require-real: no real CRM/LBNP loader exists in this repo — "
+            "real hypovolemia-induction data is gated (see "
+            "docs/synthetic_crm_task.md); refusing to pretend synthetic "
+            "data is real.")
+    data = make_synthetic_crm(**kwargs)
     data.requested_real = prefer_real
     return data
 

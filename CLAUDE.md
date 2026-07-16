@@ -409,11 +409,33 @@ open labels.
   ceiling (Akida headroom) and/or more patients — not attempted here since
   heart sounds was the higher-confidence path to a second genuinely-learning
   modality (see `docs/heart_sounds_task.md`'s framing).
-- **M (Massive hemorrhage) — PAUSED pending better physiology data.** VitalDB is
-  settled ~chance (window + case level); revisit only with LBNP/CRM induced-
-  hypovolemia data (request the gated Oslo/Yale sets, or build the synthetic
-  time-resolved generator). The CRM feature recipe (`An Explainable ML Model for
-  CRM`, MDPI Bioeng. 2023) is the method to use once real-physiology data exists.
+- **M (Massive hemorrhage) — synthetic time-resolved demo BUILT; real-data
+  validation still pending gated LBNP.** VitalDB is settled ~chance (window +
+  case level) because its label was whole-CASE, not time-aligned. Built
+  `datasets.make_synthetic_crm` (docs/synthetic_crm_task.md) to fix that BY
+  CONSTRUCTION: a synthetic subject's PPG evolves along a reserve trajectory
+  `r(t)` (1.0 -> 0.0), grounded in the explainable-CRM literature (`An
+  Explainable ML Model for CRM`, MDPI Bioeng. 2023) — pulse amplitude falls,
+  the dicrotic notch blunts/disappears (strongest cue), pulse narrows,
+  diastolic component flattens, and CRITICALLY heart rate stays flat until
+  reserve is well depleted (compensatory tachycardia only engages late) —
+  every window is labelled with its OWN trajectory point's reserve value,
+  not a pooled number. The positive class deliberately includes windows
+  where HR is still baseline (an "occult" detection band), demonstrating
+  the flagship claim: detect compensated hemorrhage before vitals move.
+  Ported onto the Akida path (reuses ECG's `build_akida_model` unchanged —
+  CRM is a waveform/morphology signal, not the heart-sounds filterbank
+  case): 5-seed synthetic measurement, float balanced acc 0.763 +/- 0.156,
+  AUROC 0.975 +/- 0.017 (every seed, including unstable ones, stayed >=0.94
+  -- the signal is reliably separable even when 2/5 seeds' float DECISION
+  THRESHOLD mis-converged; QAT fine-tuning rescued both). **Explicit
+  verdict, stated loudly in the results doc: this proves the PIPELINE and
+  that a time-aligned label is learnable, it is NOT a clinical
+  hemorrhage-detection accuracy claim** — separable by construction. See
+  `docs/synthetic_crm_results.md` for the full write-up and
+  `docs/img/crm_lead_effect.png` for the morphology-leads-HR visualization.
+  Real validation still needs the gated LBNP/CRM-induction data (request
+  the Oslo/Yale sets — see `docs/lbnp_data_request_emails.md`).
 - **R (Respiration) / A (Airway) — PAUSED. Lung sounds (ICBHI Respiratory
   Sound Database) is the planned next modality** — also audio-class and
   benchmarked like heart sounds, and it covers Respiration/Airway rather than

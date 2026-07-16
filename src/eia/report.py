@@ -75,6 +75,23 @@ _CARDS = {
         "Real induced central hypovolemia — the intended hemorrhage signal. "
         "Usually few subjects: split by subject, watch N.",
     ),
+    ("crm", "synthetic"): (
+        "0 = reserve intact (cri >= threshold, default 0.5), 1 = compromised "
+        "(cri < threshold) — cri = the reserve fraction r(t) AT THIS WINDOW'S "
+        "OWN POINT on a simulated hypovolemia trajectory (1.0 = normovolemic, "
+        "0.0 = decompensated), TIME-ALIGNED per window, not a whole-trajectory "
+        "label. The positive class deliberately includes windows where heart "
+        "rate is STILL AT BASELINE (r in (0.30, 0.50]) — detecting these is "
+        "the entire point: occult reserve loss before vitals move.",
+        "SYNTHETIC — separable by construction; a high number here proves the "
+        "PIPELINE and that the time-aligned label is learnable, NOT clinical "
+        "hemorrhage-detection accuracy. Physiologically grounded (pulse "
+        "amplitude/dicrotic-notch/width/diastolic-component relationships from "
+        "the explainable-CRM literature, MDPI Bioeng. 2023) but real validation "
+        "needs gated LBNP/CRM-induction data — see docs/synthetic_crm_task.md "
+        "and docs/synthetic_crm_results.md. Split by SUBJECT (`groups`, always "
+        "set) — windows within one trajectory are highly correlated.",
+    ),
 }
 
 
@@ -124,6 +141,8 @@ def _modality_of(data) -> str:
         return "heart"
     if name.startswith("ppg"):
         return "ppg"
+    if name.startswith("crm"):
+        return "crm"
     return getattr(data, "modality", "unknown")
 
 
