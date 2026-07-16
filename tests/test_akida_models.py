@@ -176,3 +176,61 @@ def test_crm_reuses_build_akida_model_unchanged_end_to_end():
     assert res["pred_float"].shape == (8,)
     assert res["pred_akida"].shape == (8,)
     assert 0.0 <= res["agreement_rate"] <= 1.0
+
+
+def test_build_akida_mi_model_shapes():
+    pytest.importorskip("akida")
+    model = am.build_akida_mi_model(n_leads=12, n_samples=1000, n_classes=2)
+    assert model.input_shape == (None, 12, 1000, 1)
+    assert model.output_shape == (None, 2)
+
+
+def test_mi_quantize_and_convert_and_verify_roundtrip():
+    """Same smoke test as heart's, for the MI model + its genuinely-2-D
+    (12 leads x 1000 samples) input -- confirms the Akida v2 conversion
+    constraints hold at this much larger time-axis size too, not just
+    heart's 24-sample one."""
+    pytest.importorskip("akida")
+    import tf_keras
+
+    rng = np.random.default_rng(0)
+    X = am.to_akida_input(rng.normal(size=(16, 12, 1000)).astype("float32"))
+    y = rng.integers(0, 2, size=16)
+
+    model = am.build_akida_mi_model(n_leads=12, n_samples=1000, n_classes=2)
+    model.compile(optimizer="adam",
+                   loss=tf_keras.losses.SparseCategoricalCrossentropy(from_logits=True))
+    model.fit(X, y, epochs=1, batch_size=8, verbose=0)
+
+    _qmodel, akida_model = am.quantize_and_convert(model, X[:8], num_samples=8, batch_size=4)
+    res = am.verify_against_sim(model, akida_model, X[:4])
+
+    assert res["pred_float"].shape == (4,)
+    assert res["pred_akida"].shape == (4,)
+    assert 0.0 <= res["agreement_rate"] <= 1.0
+
+
+def test_mi_reuses_signal_features_normalize_and_real_generator_shape_end_to_end():
+    """MiData (from make_synthetic_mi -- the fallback, but same shape as
+    real PTB-XL) round-trips through to_akida_input + build_akida_mi_model
+    with real data-shaped input, confirming the full mi pipeline's pieces
+    fit together, not just the shape-parametrized smoke test above."""
+    pytest.importorskip("akida")
+    import tf_keras
+
+    from eia.datasets import make_synthetic_mi
+
+    d = make_synthetic_mi(n_samples=16, n_leads=12, window=1000, seed=0)
+    X = am.to_akida_input(d.X)
+    y = d.y
+
+    model = am.build_akida_mi_model(n_leads=d.X.shape[1], n_samples=d.X.shape[2], n_classes=2)
+    assert model.input_shape == (None, 12, 1000, 1)
+    model.compile(optimizer="adam",
+                   loss=tf_keras.losses.SparseCategoricalCrossentropy(from_logits=True))
+    model.fit(X, y, epochs=1, batch_size=8, verbose=0)
+
+    _qmodel, akida_model = am.quantize_and_convert(model, X[:8], num_samples=8, batch_size=4)
+    res = am.verify_against_sim(model, akida_model, X[:4])
+    assert res["pred_float"].shape == (4,)
+    assert res["pred_akida"].shape == (4,)

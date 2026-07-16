@@ -380,6 +380,25 @@ open labels.
 - **C (Circulation) — DONE.** ECG arrhythmia on real MIT-BIH is the one modality
   genuinely learning on real data (float balanced acc 0.845). On-chip XyloSim
   fidelity (~0.56) is the open engineering gap, not a data gap.
+- **ECG deepened: arrhythmia -> myocardial infarction / ischemia
+  (docs/ptbxl_mi_task.md) — DONE, THIRD modality where the Akida fidelity
+  gap essentially closes.** Binary MI-vs-NORM on real PTB-XL (12-lead,
+  cardiologist-labeled, ~21.8% MI of 11,601 confidently-labeled records) on
+  the Akida path: float AUROC 0.890 +/- 0.024 (5 seeds) -- right at the
+  literature's ~0.9+ benchmarked range for this exact task, genuine
+  MI-detection, not chance. Akida-sim balanced acc 0.806 +/- 0.013 tracks
+  float (0.795 +/- 0.025) closely, agreement 0.917 +/- 0.079 -- the same
+  "feedforward CNN doesn't inherit Xylo's per-timestep LIF error
+  accumulation" pattern already seen twice (ECG-arrhythmia, heart sounds),
+  now a third data point. 12 leads fed as a genuinely 2-D `(leads, time)`
+  map to a new `build_akida_mi_model` (same class of input as heart sounds'
+  bands-x-time map, NOT ECG-arrhythmia's single-column reshape — MI needs
+  spatial lead information). Label rule verified against PTB-XL's own
+  shipped `example_physionet.py`, not guessed: a record is "confidently
+  MI"/"confidently NORM" iff its SCP-code diagnostic-superclass set is
+  EXACTLY `{MI}`/`{NORM}` (mixed-superclass records excluded from this
+  binary task). See `docs/ptbxl_mi_results.md`
+  for the full write-up.
 - **Heart sounds (cardiac auscultation, Circulation-adjacent) — DONE, the
   second real-data modality.** Normal/abnormal PCG on PhysioNet/CinC 2016.
   **Genuinely learns with a filterbank/band-power front-end** (float

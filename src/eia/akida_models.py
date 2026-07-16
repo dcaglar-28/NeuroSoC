@@ -1,18 +1,25 @@
-"""Akida deployment & verification path (BrainChip MetaTF) — ECG + heart sounds.
+"""Akida deployment & verification path (BrainChip MetaTF) — ECG (arrhythmia
++ MI), heart sounds, and the synthetic CRM demo.
 
 Deploy sibling of `rockpool_models.py` (which stays untouched). Where
 `rockpool_models.py` maps a Rockpool LIF SNN onto Xylo, this module builds
 small **quantized Conv2D CNNs** and runs them on **MetaTF**: `quantizeml`
 (quantization/calibration) -> `cnn2snn` (Keras -> Akida conversion) ->
-`akida.Model` (software simulator, no hardware needed). Two model builders,
-sharing everything downstream (`quantize_and_convert`/`verify_against_sim`
-are fully generic — no ECG- or heart-specific shape assumptions):
-  - `build_akida_model` (ECG): a single-channel waveform reshaped to a
+`akida.Model` (software simulator, no hardware needed). Model builders,
+sharing everything downstream (`quantize_and_convert`/`verify_against_sim`/
+`to_akida_input` are fully generic — no modality-specific shape assumptions):
+  - `build_akida_model` (ECG-arrhythmia, and reused unchanged for the
+    synthetic CRM demo): a single-channel waveform reshaped to a
     (window, 1, 1) single-column "image" — Conv2D-over-time, one real axis.
   - `build_akida_heart_model` (heart sounds): the `signal_features`
     filterbank's `(n_features, n_subwindows)` map used AS a genuine 2-D
     image (bands x time), both axes real — see its docstring for why this
     needed a different first-layer shape than ECG's.
+  - `build_akida_mi_model` (PTB-XL myocardial infarction — deepens ECG from
+    arrhythmia to MI, docs/ptbxl_mi_task.md): 12-lead ECG as a `(leads,
+    time)` map, the same "genuinely 2-D" class as heart sounds', not a
+    reuse of `build_akida_model` — MI needs spatial lead information a
+    single-column reshape would destroy.
 
 WHY A CONV2D-OVER-TIME, NOT A NATIVE CONV1D: Akida 2.0's layer catalog (see
 `docs/akida_ecg_results.md` Part 0) has no Conv1D — the closest fits are
@@ -210,6 +217,48 @@ def build_akida_heart_model(n_bands: int = 4, n_subwindows: int = 24, n_classes:
     x = dense_block(x, units=n_classes, name="predictions",
                      add_batchnorm=False, relu_activation=False)
     return Model(img_input, x, name="heart_akida")
+
+
+def build_akida_mi_model(n_leads: int = 12, n_samples: int = 1000, n_classes: int = 2):
+    """Build the float `tf_keras.Model` MI-vs-NORM classifier over the
+    `(n_leads, n_samples, 1)` 12-lead ECG "image" (`datasets.PTBXL_LEADS` x
+    100 Hz x 10 s = 1000 samples) — a genuinely 2-D fit (leads x time), the
+    same class of input as `build_akida_heart_model`'s bands x time map, NOT
+    a single-column reshape like `build_akida_model`'s ECG-arrhythmia input:
+    MI needs spatial LEAD information (which leads show ST elevation
+    localizes the infarct), so leads are a real, not phantom, axis here.
+
+    Deeper / more pooling than the heart model: `n_samples=1000` is ~40x
+    heart's `n_subwindows=24`, so the time axis needs more reduction for a
+    tractable Akida-sim forward pass. `n_leads=12` (vs. heart's 4 bands)
+    tolerates two square max-pools before the lead axis bottoms out.
+
+    Same confirmed Akida v2 constraints as every other model in this module
+    (square kernel/stride/pool every conv layer; `Conv2D -> ReLU ->
+    GlobalAveragePooling2D` ordering via `post_relu_gap=True`).
+
+    Returns an UNTRAINED model — train it with ordinary `.compile()`/
+    `.fit()` (class-weighted loss, real labels) before `quantize_and_convert`.
+    """
+    import tensorflow as tf
+    from akida_models.layer_blocks import conv_block, dense_block
+    from tf_keras import Model
+    from tf_keras.layers import Input, Rescaling
+
+    img_input = Input(shape=(n_leads, n_samples, 1), name="input", dtype=tf.uint8)
+    x = Rescaling(1.0 / 255, name="rescaling")(img_input)
+    x = conv_block(x, filters=8, kernel_size=(3, 3), name="block1",
+                    padding="same", add_batchnorm=True, strides=(2, 2))
+    x = conv_block(x, filters=16, kernel_size=(3, 3), name="block2",
+                    padding="same", add_batchnorm=True, pooling="max", pool_size=(2, 2))
+    x = conv_block(x, filters=32, kernel_size=(3, 3), name="block3",
+                    padding="same", add_batchnorm=True, pooling="max", pool_size=(2, 2))
+    x = conv_block(x, filters=64, kernel_size=(3, 3), name="block4",
+                    padding="same", add_batchnorm=True, pooling="global_avg",
+                    post_relu_gap=True)
+    x = dense_block(x, units=n_classes, name="predictions",
+                     add_batchnorm=False, relu_activation=False)
+    return Model(img_input, x, name="mi_akida")
 
 
 def quantize_and_convert(model, calibration_samples: np.ndarray,

@@ -28,6 +28,30 @@ _CARDS = {
         "0 = normal AAMI beat (N/L/R/e/j), 1 = abnormal (V/A/F/!/E).",
         "Real clinical ECG (MIT-BIH). Single-lead, subset of records.",
     ),
+    ("mi", "synthetic"): (
+        "0 = normal 12-lead beat, 1 = stylized ST-segment elevation on a "
+        "random SUBSET of leads (mimicking a regional infarct) — a crude "
+        "proxy for the single most teachable ECG-MI sign.",
+        "Separable by construction — expect ~1.0 accuracy. Proves the "
+        "pipeline, NOT a real-accuracy claim.",
+    ),
+    ("mi", "ptbxl"): (
+        "0 = confidently NORM (scp_codes' diagnostic superclass set is "
+        "EXACTLY {NORM}), 1 = confidently MI (set is EXACTLY {MI}) — "
+        "records with any other/mixed superclass (STTC, CD, HYP, or "
+        "MI+something-else) are EXCLUDED from this binary task, not "
+        "folded into either class. Label rule verified against PTB-XL's "
+        "own shipped `example_physionet.py` (not guessed): scp_codes "
+        "likelihood is NOT thresholded (0.0 means 'present, unscored', not "
+        "'absent') — matches the dataset's own official aggregation.",
+        "REAL, cardiologist-labeled 12-lead ECG (PTB-XL) — this deepens "
+        "the ECG modality from arrhythmia (MIT-BIH, single-lead) to "
+        "myocardial infarction (12-lead, benchmarked ~0.9+ AUROC in the "
+        "literature). ~21.8% MI at the full-pool level (imbalanced — "
+        "class-weighted loss + balanced-accuracy selection apply). Split "
+        "by PATIENT (`groups`) — PTB-XL is patient-respecting by design, "
+        "some patients contribute multiple recordings.",
+    ),
     ("heart", "synthetic"): (
         "0 = normal S1-S2 'lub-dub' cycle, 1 = added systolic murmur "
         "(band-limited noise filling the S1-S2 gap) — a stylised proxy for "
@@ -143,6 +167,8 @@ def _modality_of(data) -> str:
         return "ppg"
     if name.startswith("crm"):
         return "crm"
+    if name.startswith("mi"):
+        return "mi"
     return getattr(data, "modality", "unknown")
 
 

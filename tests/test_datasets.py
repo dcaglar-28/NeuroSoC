@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from eia import datasets
-from eia.datasets import CrmData, EcgData, HeartData, PpgData
+from eia.datasets import CrmData, EcgData, HeartData, MiData, PpgData
 
 
 def _fake_ecg(n=10):
@@ -413,3 +413,150 @@ def test_crm_require_real_always_raises():
         datasets.load_crm(prefer_real=True, require_real=True)
     with pytest.raises(RuntimeError, match="require-real"):
         datasets.load_crm(prefer_real=False, require_real=True)
+
+
+# --------------------------------------------------------------------------- #
+# MI (PTB-XL 12-lead myocardial infarction) — docs/ptbxl_mi_task.md
+# --------------------------------------------------------------------------- #
+# A literal lookup mirroring scp_statements.csv's REAL structure (verified
+# live against the actual file, docs/ptbxl_mi_task.md Part 0) -- code ->
+# diagnostic_class, already filtered to `diagnostic==1` rows. Real examples:
+# NORM is the sole NORM-class code; IMI/ASMI are real MI-class codes; NDT is
+# a real STTC-class code; SR/ABQRS/LVOLT are real but NON-diagnostic (no
+# diagnostic_class), i.e. NOT in this lookup at all.
+_SCP_TO_CLASS = {"NORM": "NORM", "IMI": "MI", "ASMI": "MI", "NDT": "STTC", "1AVB": "CD"}
+
+
+def test_scp_codes_to_superclasses_single_norm():
+    assert datasets.scp_codes_to_superclasses(
+        {"NORM": 100.0, "SR": 0.0}, _SCP_TO_CLASS) == {"NORM"}
+
+
+def test_scp_codes_to_superclasses_single_mi():
+    assert datasets.scp_codes_to_superclasses(
+        {"IMI": 35.0, "ABQRS": 0.0}, _SCP_TO_CLASS) == {"MI"}
+
+
+def test_scp_codes_to_superclasses_ignores_likelihood_zero_is_not_absent():
+    """THE load-bearing Part-0 finding: likelihood 0.0 means "present but
+    not confidence-scored," not "absent" -- confirmed against PTB-XL's own
+    shipped example_physionet.py, which does not threshold by likelihood at
+    all. A code present with likelihood 0.0 must still count."""
+    assert datasets.scp_codes_to_superclasses({"IMI": 0.0}, _SCP_TO_CLASS) == {"MI"}
+
+
+def test_scp_codes_to_superclasses_ignores_non_diagnostic_codes():
+    # SR ("sinus rhythm") is a real PTB-XL code with no diagnostic_class --
+    # not in the lookup -- must not contribute a superclass.
+    assert datasets.scp_codes_to_superclasses({"SR": 0.0}, _SCP_TO_CLASS) == set()
+
+
+def test_scp_codes_to_superclasses_mixed_multi_superclass():
+    assert datasets.scp_codes_to_superclasses(
+        {"IMI": 50.0, "NDT": 20.0}, _SCP_TO_CLASS) == {"MI", "STTC"}
+
+
+def test_mi_norm_label_confidently_mi():
+    assert datasets.mi_norm_label({"MI"}) == 1
+
+
+def test_mi_norm_label_confidently_norm():
+    assert datasets.mi_norm_label({"NORM"}) == 0
+
+
+def test_mi_norm_label_excludes_empty_superclass_set():
+    assert datasets.mi_norm_label(set()) is None
+
+
+def test_mi_norm_label_excludes_other_single_superclass():
+    assert datasets.mi_norm_label({"STTC"}) is None
+    assert datasets.mi_norm_label({"CD"}) is None
+    assert datasets.mi_norm_label({"HYP"}) is None
+
+
+def test_mi_norm_label_excludes_mixed_superclass_even_when_mi_present():
+    # A record with BOTH MI and STTC is NOT "confidently MI" for this
+    # binary task -- excluded, not folded into the MI class.
+    assert datasets.mi_norm_label({"MI", "STTC"}) is None
+    assert datasets.mi_norm_label({"MI", "NORM"}) is None
+
+
+def test_make_synthetic_mi_shape_dtype_and_no_groups():
+    d = datasets.make_synthetic_mi(n_samples=20, n_leads=12, window=1000, seed=0)
+    assert d.X.shape == (20, 12, 1000)
+    assert d.X.dtype == np.float32
+    assert d.y.dtype == np.int64
+    assert set(np.unique(d.y).tolist()) <= {0, 1}
+    assert d.groups is None  # no natural patient grouping for synthetic samples
+    assert d.source == "synthetic"
+
+
+def test_mi_default_is_synthetic_and_not_requested_real():
+    d = datasets.load_mi(prefer_real=False, n_samples=10)
+    assert d.source == "synthetic"
+    assert d.requested_real is False
+
+
+def test_mi_real_success_sets_requested_real_and_real_source():
+    fake = MiData(X=np.zeros((5, 12, 1000), dtype="float32"),
+                   y=np.zeros(5, dtype="int64"), fs=100.0, source="ptbxl",
+                   groups=np.arange(5, dtype="int64"))
+    with patch.object(datasets, "load_ptbxl", return_value=fake):
+        d = datasets.load_mi(prefer_real=True)
+        assert d.source == "ptbxl"
+        assert d.requested_real is True
+        assert d.groups is not None
+
+
+def test_mi_real_failure_falls_back_but_marks_requested_real():
+    with patch.object(datasets, "load_ptbxl", side_effect=RuntimeError("no network")):
+        d = datasets.load_mi(prefer_real=True, require_real=False, n_samples=10)
+        assert d.source == "synthetic"
+        assert d.requested_real is True
+
+
+def test_mi_require_real_raises_instead_of_falling_back():
+    with patch.object(datasets, "load_ptbxl", side_effect=RuntimeError("no network")):
+        with pytest.raises(RuntimeError, match="require-real"):
+            datasets.load_mi(prefer_real=True, require_real=True)
+
+
+def test_mi_require_real_without_prefer_real_is_a_usage_error():
+    with pytest.raises(ValueError):
+        datasets.load_mi(prefer_real=False, require_real=True)
+
+
+def test_mi_no_leakage_patient_split():
+    """Mirrors the heart/crm no-leakage tests: a MiData with several windows
+    per patient (PTB-XL patients can contribute multiple recordings) must
+    never straddle a patient across train/val/test."""
+    from eia import case_level
+    rng = np.random.default_rng(0)
+    n_patients = 15
+    windows_per_patient = 3
+    n = n_patients * windows_per_patient
+    groups = np.repeat(np.arange(n_patients), windows_per_patient)
+    d = MiData(X=rng.normal(size=(n, 12, 1000)).astype("float32"),
+                y=rng.integers(0, 2, size=n).astype("int64"),
+                fs=100.0, source="ptbxl", groups=groups)
+    _Xtr, _Xval, _Xte, _ytr, _yval, _yte, gtr, gval, gte = case_level.split_data(d, seed=0)
+    tr_s, val_s, te_s = set(gtr.tolist()), set(gval.tolist()), set(gte.tolist())
+    assert not (tr_s & val_s)
+    assert not (tr_s & te_s)
+    assert not (val_s & te_s)
+
+
+def test_mi_per_lead_normalize_shape_compatible():
+    """MiData.X's (n, 12, 1000) convention is exactly the (n, C, T) shape
+    `signal_features.normalize_features_train_only` (heart's per-channel
+    train-only z-score, reused verbatim for mi's per-lead norm -- see
+    scripts/akida_verify.py) expects."""
+    from eia import signal_features
+    rng = np.random.default_rng(0)
+    Xtr = rng.normal(loc=5.0, scale=2.0, size=(30, 12, 1000)).astype("float32")
+    Xval = rng.normal(loc=5.0, scale=2.0, size=(10, 12, 1000)).astype("float32")
+    Xte = rng.normal(loc=5.0, scale=2.0, size=(10, 12, 1000)).astype("float32")
+    Xtr_n, Xval_n, Xte_n = signal_features.normalize_features_train_only(Xtr, Xval, Xte)
+    assert Xtr_n.shape == Xtr.shape
+    assert np.allclose(Xtr_n.mean(axis=(0, 2)), 0.0, atol=1e-5)
+    assert np.allclose(Xtr_n.std(axis=(0, 2)), 1.0, atol=1e-5)

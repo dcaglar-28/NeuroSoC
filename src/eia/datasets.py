@@ -32,6 +32,37 @@ class EcgData:
 
 
 @dataclass
+class MiData:
+    """Myocardial-infarction detection from 12-lead ECG (PTB-XL) — deepens
+    the ECG modality from arrhythmia (`EcgData`/MIT-BIH, single-lead,
+    per-beat) to MI (12-lead, per-recording). Its OWN dataclass, not a reuse
+    of `EcgData`, because the shape genuinely differs: MI needs spatial
+    lead information (`(leads, time)`, 2-D per sample), not a single-lead
+    beat window — see docs/ptbxl_mi_task.md."""
+    X: np.ndarray  # (n_samples, 12, 1000) float32 — 12-lead PTB-XL recording,
+                    # 100 Hz, 10 s, RAW mV (not yet normalized — per-lead
+                    # z-score is fit on the TRAIN split only, post-split, via
+                    # `signal_features.normalize_features_train_only`, the
+                    # exact function heart sounds already uses for the same
+                    # reason: per-channel scales differ and must not leak
+                    # val/test statistics into the fit).
+    y: np.ndarray   # (n_samples,) int64 — 0 = NORM (confidently normal), 1 = MI
+                     # (confidently myocardial infarction) — see the label
+                     # rule in `load_ptbxl`'s docstring.
+    fs: float       # sampling rate (Hz) — 100.0 (PTB-XL's `records100/`)
+    source: str     # "ptbxl" or "synthetic"
+    requested_real: bool = False
+    # Patient id per window — ALWAYS set (PTB-XL is patient-respecting by
+    # design: some patients contribute multiple recordings). Callers MUST
+    # split by group (`case_level.split_data`), never by record — a
+    # `strat_fold`-equivalent guarantee via `GroupShuffleSplit` on this
+    # field, confirmed against PTB-XL's own shipped `strat_fold` column to
+    # give the same patient-disjointness property (see docs/ptbxl_mi_task.md
+    # Part 0).
+    groups: np.ndarray | None = None
+
+
+@dataclass
 class HeartData:
     X: np.ndarray  # (n_samples, window) float32 — single-channel PCG, same
                     # 2-D convention as EcgData (heart sounds are an
@@ -278,6 +309,310 @@ def load_ecg(prefer_real: bool = True, require_real: bool = False,
     if window is not None:
         synth_kwargs["window"] = window
     data = make_synthetic_ecg(**synth_kwargs)
+    data.requested_real = prefer_real
+    return data
+
+
+# --------------------------------------------------------------------------- #
+# Myocardial infarction (12-lead ECG, PTB-XL) — deepens ECG from arrhythmia
+# to MI/ischemia (docs/ptbxl_mi_task.md). Real loader + synthetic fallback.
+# --------------------------------------------------------------------------- #
+def _mi_beat_leads(n: int, rng: np.random.Generator, is_mi: bool,
+                    n_leads: int = 12) -> np.ndarray:
+    """One stylized `n_leads`-lead beat cycle, `n` samples: reuses
+    `_normal_beat`'s single-lead PQRST shape per lead (with per-lead
+    amplitude variation, a crude stand-in for real inter-lead morphology
+    differences), and for `is_mi=True` adds a stylized ST-segment elevation
+    -- a slow positive deflection between the QRS and T wave, the single
+    most teachable ECG sign of myocardial infarction -- to a random SUBSET
+    of leads (mimicking a regional infarct, which doesn't show on every
+    lead). A synthetic PIPELINE fallback only; never preferred over real
+    PTB-XL (see `load_mi`) and not a diagnostic-accuracy claim.
+    """
+    base = _normal_beat(n, rng)
+    t = np.linspace(0, 1, n)
+    affected = (set(rng.choice(n_leads, size=int(rng.integers(2, 5)), replace=False).tolist())
+                if is_mi else set())
+    leads = np.empty((n_leads, n), dtype=np.float64)
+    for lead in range(n_leads):
+        sig = base * rng.uniform(0.7, 1.3)
+        if lead in affected:
+            sig = sig + _gaussian(t, 0.55, 0.09, rng.uniform(0.15, 0.35))
+        leads[lead] = sig
+    return leads
+
+
+def make_synthetic_mi(
+    n_samples: int = 800,
+    n_leads: int = 12,
+    window: int = 1000,
+    fs: float = 100.0,
+    abnormal_frac: float = 0.3,
+    beats_per_window: int = 10,
+    noise: float = 0.03,
+    seed: int = 0,
+) -> MiData:
+    """Generate a synthetic 12-lead MI-vs-NORM set: `window=1000` at
+    `fs=100` Hz mirrors PTB-XL's `records100/` shape (10 s), with
+    `beats_per_window` stylized beats tiled across the window (mirroring
+    the CRM generator's multi-pulse tiling), each independently drawn via
+    `_mi_beat_leads`. `groups=None` (no natural patient grouping for
+    synthetic samples, matching every other synthetic generator here).
+    """
+    rng = np.random.default_rng(seed)
+    beat_len = max(4, window // beats_per_window)
+    X = np.empty((n_samples, n_leads, window), dtype=np.float32)
+    y = np.empty((n_samples,), dtype=np.int64)
+    for i in range(n_samples):
+        is_mi = rng.random() < abnormal_frac
+        y[i] = 1 if is_mi else 0
+        sig = np.zeros((n_leads, window), dtype=np.float64)
+        onset = 0
+        while onset < window:
+            blen = min(beat_len, window - onset)
+            sig[:, onset:onset + blen] += _mi_beat_leads(beat_len, rng, is_mi, n_leads)[:, :blen]
+            onset += beat_len
+        sig = sig + rng.normal(0, noise, size=sig.shape)
+        X[i] = sig.astype(np.float32)
+    return MiData(X=X, y=y, fs=fs, source="synthetic")
+
+
+PTBXL_VERSION = "1.0.3"
+PTBXL_LEADS = ("I", "II", "III", "AVR", "AVL", "AVF", "V1", "V2", "V3", "V4", "V5", "V6")
+PTBXL_NATIVE_FS = 100.0  # records100/ -- confirmed live, docs/ptbxl_mi_task.md Part 0
+
+
+def _fetch_ptbxl_index(cache_dir: str, timeout_sec: float = 60.0) -> "pd.DataFrame":
+    """Fetch/cache `ptbxl_database.csv` + `scp_statements.csv` and return a
+    DataFrame of every record CONFIDENTLY labeled MI-only or NORM-only for
+    the binary task, with columns `filename_lr`, `patient_id`, `strat_fold`,
+    `label` (1=MI, 0=NORM).
+
+    **Label rule (verified against PTB-XL's own shipped `example_physionet.py`,
+    not guessed — docs/ptbxl_mi_task.md Part 0):** `scp_codes` is a
+    stringified `{SCP_code: likelihood}` dict; likelihood `0.0` means
+    "present but not confidence-scored" — NOT "absent" — so, matching the
+    dataset's own official aggregation example, we do NOT threshold by
+    likelihood. Superclass membership: filter `scp_statements.csv` to rows
+    with `diagnostic==1` (44 of 71 codes; confirmed this is exactly the set
+    with `diagnostic_class` non-null), then a record's superclass set is
+    every `diagnostic_class` among its `scp_codes` keys that's in that
+    diagnostic-eligible set (a record can have >1 superclass — the
+    multi-label case this binary task deliberately excludes). **A record
+    is "confidently MI"** iff that set is EXACTLY `{"MI"}` (not merely
+    containing MI alongside e.g. STTC or CD); **"confidently NORM"** iff
+    EXACTLY `{"NORM"}`. Confirmed live counts (full dataset, all 21,799
+    records / 18,869 patients): 2,532 MI-only + 9,069 NORM-only = 11,601
+    eligible (~21.8% MI) -- imbalanced, class-weighted loss is applied
+    downstream. `validated_by_human` (True for ~73.7% of records) is
+    reported for information but NOT used to filter, matching the official
+    example and the overwhelming majority of published PTB-XL baselines.
+
+    `strat_fold` (1-10) is PTB-XL's own shipped, patient-respecting
+    stratified fold assignment — confirmed live that no patient appears in
+    more than one fold, and that folds 1-8 (train) / 9 (val) / 10 (test)
+    each keep the ~20-22% MI ratio. `load_ptbxl` doesn't use `strat_fold`
+    directly, though: it sets `MiData.groups = patient_id` and leaves
+    splitting to the existing `case_level.split_data` (`GroupShuffleSplit`
+    on patient id) — equally patient-safe, and reuses the exact split
+    machinery every other modality here already uses, rather than adding a
+    parallel fold-based splitter for one modality.
+    """
+    import os
+    import urllib.request
+
+    import pandas as pd
+
+    os.makedirs(cache_dir, exist_ok=True)
+    base = f"https://physionet.org/files/ptb-xl/{PTBXL_VERSION}"
+
+    def _fetch(name):
+        path = os.path.join(cache_dir, name)
+        if not os.path.exists(path):
+            with urllib.request.urlopen(f"{base}/{name}", timeout=timeout_sec) as resp:
+                data = resp.read()
+            with open(path, "wb") as f:
+                f.write(data)
+        return path
+
+    db = pd.read_csv(_fetch("ptbxl_database.csv"), index_col="ecg_id")
+    scp = pd.read_csv(_fetch("scp_statements.csv"), index_col=0)
+    diagnostic = scp[scp["diagnostic"] == 1]
+    scp_to_class = diagnostic["diagnostic_class"].to_dict()
+
+    import ast
+    db["scp_codes"] = db["scp_codes"].apply(ast.literal_eval)
+    db["superclasses"] = db["scp_codes"].apply(
+        lambda d: scp_codes_to_superclasses(d, scp_to_class))
+    db["label"] = db["superclasses"].apply(mi_norm_label)
+    sel = db[db["label"].notna()].copy()
+    sel["label"] = sel["label"].astype("int64")
+    return sel[["filename_lr", "patient_id", "strat_fold", "label"]]
+
+
+def scp_codes_to_superclasses(scp_codes: dict, scp_to_class: dict) -> set:
+    """Pure mapping step of `_fetch_ptbxl_index`'s label rule, pulled out
+    for direct unit-testing on a literal dict (no pandas/network needed):
+    every diagnostic SUPERCLASS among `scp_codes`' keys that's present in
+    `scp_to_class` (an SCP-code -> diagnostic_class lookup, i.e. already
+    filtered to `scp_statements.csv`'s `diagnostic==1` rows). Deliberately
+    ignores `scp_codes`' likelihood VALUES — see `_fetch_ptbxl_index`'s
+    docstring for why (0.0 means "present, unscored," not "absent," per
+    PTB-XL's own official `example_physionet.py`).
+    """
+    return set(scp_to_class[k] for k in scp_codes.keys() if k in scp_to_class)
+
+
+def mi_norm_label(superclasses: set) -> int | None:
+    """The binary MI-vs-NORM label rule, pulled out for direct testing:
+    1 if `superclasses` is EXACTLY `{"MI"}`, 0 if EXACTLY `{"NORM"}`,
+    `None` (excluded from the binary task) for anything else — empty,
+    single-other-superclass (STTC/CD/HYP alone), or ANY multi-superclass
+    combination (including one that contains MI alongside something else,
+    e.g. `{"MI", "STTC"}` — that record is NOT "confidently MI" for this
+    binary task's purposes, it's excluded, not folded into either class).
+    """
+    if superclasses == {"MI"}:
+        return 1
+    if superclasses == {"NORM"}:
+        return 0
+    return None
+
+
+def _load_ptbxl_record(filename_lr: str, cache_dir: str):
+    """Stream one PTB-XL 100 Hz 12-lead record via wfdb and cache it.
+    Selects/reorders leads by NAME (`PTBXL_LEADS`), not position — confirmed
+    live that every checked record's `sig_name` already matches this exact
+    order, but selecting by name is the same "don't assume, verify by name"
+    discipline `_load_cinc2016_record` already applies for its bonus-ECG-
+    channel gotcha, cheap insurance against a record that doesn't.
+    """
+    import os
+    safe_name = filename_lr.replace("/", "_")
+    path = os.path.join(cache_dir, f"{safe_name}.npz")
+    if os.path.exists(path):
+        d = np.load(path)
+        return d["sig"], float(d["fs"])
+    import wfdb
+    os.makedirs(cache_dir, exist_ok=True)
+    record_dir, record_name = filename_lr.rsplit("/", 1)
+    rec = wfdb.rdrecord(record_name, pn_dir=f"ptb-xl/{PTBXL_VERSION}/{record_dir}")
+    lead_idx = [rec.sig_name.index(lead) for lead in PTBXL_LEADS]
+    sig = rec.p_signal[:, lead_idx].T.astype(np.float32)  # (12, 1000)
+    fs = float(rec.fs)
+    np.savez(path, sig=sig, fs=fs)
+    return sig, fs
+
+
+def load_ptbxl(
+    max_records: int | None = 2000,
+    cache_dir: str = "data/ptbxl",
+    seed: int = 0,
+    verbose: bool = True,
+    record_timeout_sec: float = 60.0,
+    retries: int = 1,
+) -> MiData:
+    """Stream PhysioNet PTB-XL 12-lead ECG recordings, labelled MI-vs-NORM
+    (see `_fetch_ptbxl_index`'s docstring for the full label-rule
+    derivation and Part-0 findings). Requires `wfdb` and network access.
+
+    Args:
+        max_records: cap on how many eligible recordings to actually pull —
+            a seeded random subset of the ~11,601-record eligible pool
+            (2,532 MI + 9,069 NORM), not just the first N, so a capped run
+            isn't biased toward low ecg_ids. `None` pulls the full pool.
+        cache_dir: per-record cache (gitignored `data/`), plus the two
+            small index CSVs.
+        seed: controls the random `max_records` subsample.
+        verbose: print the pull plan and per-record progress.
+        record_timeout_sec/retries: `_call_with_timeout` wall-clock cap and
+            retry count per record (skip-and-continue, never hang).
+
+    Returns:
+        MiData with `source="ptbxl"`, `groups` = patient id per window (see
+        `MiData`'s docstring — split via `case_level.split_data`, never by
+        record).
+    """
+    try:
+        import wfdb  # noqa: F401  (import check; actual reads use wfdb.rdrecord)
+    except ImportError as e:  # pragma: no cover
+        raise ImportError("Install the data extra: pip install 'eia[data]'") from e
+
+    import time
+
+    rng = np.random.default_rng(seed)
+    index, err = _call_with_timeout(_fetch_ptbxl_index, record_timeout_sec, retries, cache_dir)
+    if err is not None:
+        raise RuntimeError(f"failed to fetch/parse the PTB-XL index: {err}")
+
+    if max_records is not None and max_records < len(index):
+        chosen = rng.choice(len(index), size=max_records, replace=False)
+        index = index.iloc[sorted(chosen.tolist())]
+
+    n_mi = int((index["label"] == 1).sum())
+    if verbose:
+        print(f"[ptbxl] plan: {len(index)} recordings "
+              f"({n_mi} MI, {len(index) - n_mi} NORM), cache_dir={cache_dir!r}")
+
+    X_list, y_list, group_list = [], [], []
+    for i, (_ecg_id, row) in enumerate(index.iterrows(), 1):
+        if verbose and (i % 100 == 0 or i == len(index)):
+            print(f"[ptbxl] {i}/{len(index)} recordings loaded so far ({len(X_list)} kept)")
+        t0 = time.time()
+        loaded, err = _call_with_timeout(
+            _load_ptbxl_record, record_timeout_sec, retries, row["filename_lr"], cache_dir)
+        elapsed = time.time() - t0
+        if err is not None:
+            print(f"[warn] ptbxl {row['filename_lr']}: failed to load ({err}) "
+                  f"after {elapsed:.0f}s; skipping record.")
+            continue
+        sig, _fs = loaded
+        if not np.isfinite(sig).all():
+            # Same real, confirmed data-quality guard as CinC 2016's loader
+            # (docs/heart_sounds_results.md) -- skip rather than train on it.
+            print(f"[warn] ptbxl {row['filename_lr']}: non-finite raw signal; skipping record.")
+            continue
+        X_list.append(sig)
+        y_list.append(int(row["label"]))
+        group_list.append(int(row["patient_id"]))
+
+    if not X_list:
+        raise RuntimeError("No PTB-XL records loaded.")
+
+    return MiData(X=np.stack(X_list), y=np.array(y_list, dtype=np.int64),
+                   fs=PTBXL_NATIVE_FS, source="ptbxl",
+                   groups=np.array(group_list, dtype=np.int64))
+
+
+def load_mi(prefer_real: bool = True, require_real: bool = False,
+            **kwargs) -> MiData:
+    """Load MI-vs-NORM data, preferring real PTB-XL but falling back to
+    synthetic. Mirrors `load_ecg`'s provenance contract exactly.
+
+    Args:
+        prefer_real: try `load_ptbxl()` first.
+        require_real: if real data was requested and fails to load, raise
+            instead of silently substituting synthetic. Every allowed
+            fallback still prints a `[warn]` line naming the reason.
+        **kwargs: forwarded to `load_ptbxl` (max_records, cache_dir, seed)
+            when real; ignored when falling back to synthetic.
+    """
+    if require_real and not prefer_real:
+        raise ValueError("require_real=True has no effect with prefer_real=False "
+                          "(nothing was asked to be real).")
+    if prefer_real:
+        try:
+            data = load_ptbxl(**kwargs)
+            data.requested_real = True
+            return data
+        except Exception as e:  # noqa: BLE001  — any failure -> synthetic (or raise)
+            if require_real:
+                raise RuntimeError(
+                    f"--require-real: real PTB-XL failed to load ({e}); "
+                    "refusing to silently substitute synthetic MI data."
+                ) from e
+            print(f"[warn] real PTB-XL unavailable ({e}); falling back to synthetic MI data.")
+    data = make_synthetic_mi()
     data.requested_real = prefer_real
     return data
 
