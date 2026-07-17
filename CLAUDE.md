@@ -399,6 +399,33 @@ open labels.
   EXACTLY `{MI}`/`{NORM}` (mixed-superclass records excluded from this
   binary task). See `docs/ptbxl_mi_results.md`
   for the full write-up.
+- **ECG deepened again: MI -> shockable rhythm (VF/rapid-VT, the
+  defibrillate-or-not decision) (docs/shockable_rhythm_task.md) — DONE.**
+  Binary shockable-vs-non-shockable on real VFDB (MIT-BIH Malignant
+  Ventricular Ectopy DB, 22 records) + CUDB (Creighton Univ. Ventricular
+  Tachyarrhythmia DB, 35 records), 5s AED-style windows labeled by the
+  covering rhythm annotation (de Bruin/AHA-aligned rule: VF/VFIB/VFL or VT
+  >=150bpm, VT rate estimated PER WINDOW from the raw waveform since VFDB
+  has no per-beat annotations). Reuses `build_akida_model` UNCHANGED
+  (single-lead waveform, same architecture class as ECG-arrhythmia/CRM, not
+  MI/heart's 2-D map). Float AUROC 0.942 +/- 0.012 (5 seeds) is a strong,
+  stable signal confirming the Part-0 rhythm mapping
+  is correct, but the argmax decision threshold is checkpoint-sensitive
+  (balanced acc 0.787 +/- 0.066, sensitivity 0.718 +/- 0.196, specificity
+  0.856 +/- 0.197) -- the AHA sensitivity>=90%/specificity>=95% goals are
+  NOT met simultaneously on average (though individual seeds clear one or
+  the other), the same checkpoint-sensitivity pattern already documented for
+  real MIT-BIH ECG (docs/ecg_quant_fixes_results.md). Notably, Akida-sim
+  (post-QAT) tracks ABOVE float on every headline metric this time
+  (balanced acc 0.878 +/- 0.037, specificity 0.963 +/- 0.035 -- clears the
+  AHA goal on average -- sensitivity 0.794 +/- 0.085), suggesting the QAT
+  fine-tune step did real additional optimization here, not just a fidelity
+  check; float-vs-Akida-sim agreement 0.883 +/- 0.097 is lower/more variable
+  than ECG-arrhythmia/MI's, consistent with disagreements clustering at low
+  decision margin. A real data-quality finding: 28 of CUDB's 35 records have
+  genuine NaN samples (skipped, same guard as CinC 2016's), so only 2 CUDB
+  records actually contributed windows -- this measurement is ~92%
+  VFDB-driven. See `docs/shockable_rhythm_results.md` for the full write-up.
 - **Heart sounds (cardiac auscultation, Circulation-adjacent) — DONE, the
   second real-data modality.** Normal/abnormal PCG on PhysioNet/CinC 2016.
   **Genuinely learns with a filterbank/band-power front-end** (float

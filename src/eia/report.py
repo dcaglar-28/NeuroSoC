@@ -52,6 +52,35 @@ _CARDS = {
         "by PATIENT (`groups`) — PTB-XL is patient-respecting by design, "
         "some patients contribute multiple recordings.",
     ),
+    ("shockable", "synthetic"): (
+        "0 = organized normal-rate rhythm (stylised normal PQRST tiled at "
+        "60-100 bpm), 1 = shockable: chaotic VF-like (dominant 3-9 Hz "
+        "sinusoid + noise, no organized QRS) or fast/wide/regular VT-like "
+        "(wide-QRS beat tiled at 150-220 bpm, always at/above the rate "
+        "threshold by construction).",
+        "Separable by construction — expect ~1.0 accuracy. Proves the "
+        "pipeline, NOT a real-accuracy claim.",
+    ),
+    ("shockable", "vfdb_cudb"): (
+        "0 = non-shockable rhythm (normal sinus, sinus brady, nodal, SVTA, "
+        "AFIB/AF, bigeminy-adjacent, ventricular escape, paced, high-grade "
+        "ectopy short of VT/VF, asystole, or VT below the rate threshold); "
+        "1 = shockable (VF/VFIB/VFL, or VT at/above 150 bpm — de Bruin et "
+        "al. / AHA-aligned rule, see docs/shockable_rhythm_task.md). "
+        "5-second AED-style windows, labeled by the rhythm annotation "
+        "covering the window END-TO-END (min_coverage=1.0) — windows "
+        "straddling a rhythm change, or dominated by annotated noise, are "
+        "dropped, not force-labeled. VT rate is estimated PER WINDOW from "
+        "the raw waveform (band-pass + peak-picking; neither dataset "
+        "carries usable per-beat rate annotations for VFDB).",
+        "REAL clinical ECG (MIT-BIH Malignant Ventricular Ectopy Database + "
+        "Creighton University Ventricular Tachyarrhythmia Database, "
+        "single-lead, 250 Hz native). Shockable is the MINORITY class. "
+        "Split by RECORD (`groups`) — VFDB/CUDB records are different "
+        "patients. VT-rate estimation is a lightweight peak-picker, not a "
+        "diagnostic-grade QRS detector (validated against known-VT/known-"
+        "normal windows in Part 0, not a clinical-accuracy guarantee).",
+    ),
     ("heart", "synthetic"): (
         "0 = normal S1-S2 'lub-dub' cycle, 1 = added systolic murmur "
         "(band-limited noise filling the S1-S2 gap) — a stylised proxy for "
@@ -169,6 +198,8 @@ def _modality_of(data) -> str:
         return "crm"
     if name.startswith("mi"):
         return "mi"
+    if name.startswith("shockable"):
+        return "shockable"
     return getattr(data, "modality", "unknown")
 
 

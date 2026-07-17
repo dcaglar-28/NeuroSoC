@@ -108,6 +108,34 @@ class PpgData:
 
 
 @dataclass
+class ShockableData:
+    """Shockable-rhythm (VF / rapid-VT) vs. non-shockable binary
+    classification from ECG — the defibrillate-or-not (AED) decision (see
+    docs/shockable_rhythm_task.md). Deepens ECG under Circulation:
+    arrhythmia (MIT-BIH) -> MI (PTB-XL) -> shockable rhythm (VFDB/CUDB).
+    This is a morphology/rhythm signal (VF = disorganized, no clear QRS; VT =
+    wide, fast, regular QRS), so it uses the RAW-WAVEFORM front-end, same 2-D
+    `(n_samples, window)` convention as `EcgData`/`CrmData` — NOT heart
+    sounds' spectral filterbank map."""
+    X: np.ndarray  # (n_samples, window) float32 — single-lead ECG window,
+                    # per-window z-scored (same convention as `load_mitbih`).
+    y: np.ndarray   # (n_samples,) int64 — 0 = non-shockable, 1 = shockable
+                     # (VF/VFIB/VFL, or VT at/above `vt_rate_threshold` bpm —
+                     # see `rhythm_code_to_shockable`).
+    fs: float       # sampling rate (Hz) of the TIMESTEP axis (post
+                     # `resample_to`, same decoupling as `load_mitbih`).
+    source: str     # "vfdb_cudb" or "synthetic"
+    requested_real: bool = False
+    # Record id per window (e.g. "vfdb:418", "cudb:cu01"), ALWAYS set for
+    # real data — VFDB/CUDB records are different PATIENTS/recordings, so
+    # callers MUST split by record (`case_level.split_data`'s
+    # GroupShuffleSplit path), never by window — same discipline as
+    # `MiData`/`CrmData`'s `groups`. `None` for synthetic (no natural
+    # grouping, matching every other synthetic generator here).
+    groups: np.ndarray | None = None
+
+
+@dataclass
 class CrmData:
     """A synthetic, TIME-RESOLVED Compensatory Reserve trajectory dataset —
     see docs/synthetic_crm_task.md. Same 2-D (n_samples, window) PPG-shaped
@@ -1555,6 +1583,514 @@ def load_crm(prefer_real: bool = False, require_real: bool = False,
             "docs/synthetic_crm_task.md); refusing to pretend synthetic "
             "data is real.")
     data = make_synthetic_crm(**kwargs)
+    data.requested_real = prefer_real
+    return data
+
+
+# --------------------------------------------------------------------------- #
+# Shockable-rhythm (VF/VT) detection — the defibrillate-or-not (AED) decision
+# (docs/shockable_rhythm_task.md). Real loader (VFDB + CUDB via wfdb) +
+# synthetic fallback.
+#
+# PART 0 FINDINGS (verified live against PhysioNet before writing this
+# loader, not assumed — see docs/shockable_rhythm_task.md):
+#   - VFDB (MIT-BIH Malignant Ventricular Ectopy Database, `pn_dir="vfdb"`):
+#     22 records, confirmed live via `wfdb.get_record_list('vfdb')`
+#     (`VFDB_RECORDS`), 250 Hz, 2 channels (both named "ECG" — only channel 0
+#     used here, for shape consistency with CUDB's single channel; see
+#     "single-lead, not 2-D" below).
+#   - CUDB (Creighton University Ventricular Tachyarrhythmia Database,
+#     `pn_dir="cudb"`): 35 records (`CUDB_RECORDS`), 250 Hz, 1 channel.
+#   - **Rhythm annotations are episode markers, not per-beat labels — the
+#     load-bearing detail.** In both datasets' `.atr` files, rhythm changes
+#     are recorded as annotations with `symbol == '+'` and the actual rhythm
+#     code in `aux_note` (parenthesis-prefixed, NUL-padded, e.g. `'(VF\x00'`)
+#     — confirmed live by dumping every annotation's `(symbol, aux_note)`
+#     pair. CUDB's `.atr` ALSO carries ~950 per-beat `symbol='N'` annotations
+#     per record with EMPTY `aux_note` (a generic beat marker — CUDB's own
+#     documentation states "all beats are labelled normal (although many are
+#     ectopic)", i.e. NOT diagnostically informative per-beat) — these are
+#     filtered out (`_rhythm_intervals_from_annotations` keeps only
+#     `symbol=='+'`) before building the rhythm-episode timeline; conflating
+#     them with rhythm annotations was an early bug in this loader's Part-0
+#     exploration (inflated episode counts to ~20,000 with sub-second
+#     "episode" durations) — caught by checking `ann.symbol`, not just
+#     `aux_note`, before trusting any duration statistic.
+#   - **Rhythm codes actually present** (confirmed live, cross-checked
+#     against PhysioNet's own VFDB documentation, which spells out N/NSR,
+#     VF/VFIB, VFL, VT, NOISE, ASYS, NOD, SBR, HGEA, B, BI, PM, VER, AFIB —
+#     every VFDB code found live is in that list): VFDB has AFIB, ASYS, B,
+#     BI, HGEA, N, NOD, NOISE, NSR, PM, SBR, SVTA, VER, VF, VFIB, VFL, VT.
+#     CUDB has the smaller set AF, N, VF, VT (AF read as the standard
+#     atrial-fibrillation abbreviation, consistent with VFDB's AFIB — CUDB's
+#     own PhysioNet page does not itself spell out code meanings, only
+#     confirms 250 Hz / 35 records / single-channel and that annotations
+#     mark rhythm-of-interest onsets).
+#   - **Episode-duration distribution is why window LABELING can't require
+#     an episode to be longer than the window** (measured live): VFDB's VFL
+#     episodes have median duration 2.8s (73% under 5s), VT episodes median
+#     4.2s (54% under 5s) — SHORTER than the "5-8s" AED-window range itself
+#     for a majority of cases. A full-window-containment labeling rule
+#     therefore does NOT require picking a window shorter than these
+#     episodes (that's not achievable for the majority of them regardless of
+#     window choice within 4-8s); it just means many individual short
+#     episodes contribute zero windows (a fine-grained rhythm alternation is
+#     dropped as ambiguous, not force-labeled) — see `min_coverage` below.
+#
+# WINDOW DURATION + LABELING RULE (`SHOCKABLE_WINDOW_SEC=5.0`,
+# `SHOCKABLE_MIN_COVERAGE=1.0`) — chosen empirically in Part 0 by sweeping
+# window_sec in {4,5,6,8} x min_coverage in {0.5,0.6,0.8,1.0} against the
+# cached real annotation timelines and comparing total-window / class-
+# balance yield: 5s at FULL containment (min_coverage=1.0 — a window is
+# labeled only if ONE rhythm code covers it end-to-end; anything straddling
+# a rhythm change is dropped as ambiguous/transition, per
+# docs/shockable_rhythm_task.md's task framing) still yields ~8,000 windows
+# combined (~7,600 VFDB + ~450 CUDB) with a healthy shockable-class count —
+# full containment costs comparatively little yield vs. the loosest
+# (min_coverage=0.5) config, so the strictest, least label-ambiguous rule
+# was kept rather than trading label quality for a modest yield increase.
+# 5.0s sits at the low end of the task's specified 5-8s AED-window range —
+# the empirical sweep showed longer windows (6s, 8s) cost yield roughly
+# proportionally with no offsetting quality gain, so 5.0s was preferred.
+#
+# SHOCKABLE DEFINITION (adopted, cited as in docs/shockable_rhythm_task.md —
+# the de Bruin et al. / AHA-aligned rule): SHOCKABLE = ventricular
+# fibrillation (VF/VFIB in VFDB's vocabulary, or VF/VFL — ventricular
+# flutter, clinically treated as VF-equivalent and shockable) OR rapid
+# ventricular tachycardia (VT at or above `VT_RATE_THRESHOLD_BPM`).
+# NON-SHOCKABLE = everything else: normal sinus (N/NSR), sinus bradycardia
+# (SBR), nodal/junctional (NOD), supraventricular tachyarrhythmia (SVTA),
+# atrial fibrillation (AFIB/AF), bigeminy/1st-degree-block-adjacent codes
+# (B/BI), ventricular escape rhythm (VER), paced rhythm (PM), high-grade
+# ventricular ectopic activity short of sustained VT/VF (HGEA), asystole
+# (ASYS — clinically a NON-shockable rhythm: AEDs correctly advise no shock
+# for a flat line, matching the parenthetical example list in
+# docs/shockable_rhythm_task.md's Part-0 rule statement), and slow VT (below
+# the rate threshold). NOISE is DROPPED, not folded into non-shockable — per
+# docs/shockable_rhythm_task.md's task-framing section ("drop... windows
+# dominated by annotated noise"): noise is a signal-quality state, not a
+# rhythm, and training a classifier to call noise "non-shockable" would
+# reward learning nothing about the actual decision.
+#
+# VT RATE HANDLING: VFDB carries NO per-beat annotations (confirmed —
+# `ann.symbol` is `{'+'}` only across every VFDB record), so a VT episode's
+# rate can't be read off annotation timing directly; `_estimate_rate_bpm`
+# computes it per WINDOW from the raw waveform instead (5-25 Hz band-pass +
+# peak-picking on the squared signal, 200ms minimum peak spacing = a 300bpm
+# physiological ceiling) — validated in Part 0 against known-VT windows
+# (measured 173-275bpm across VFDB record 421's 50 VT episodes and across a
+# long 885s VT episode in record 427, all comfortably above threshold; a
+# sanity check against normal-rhythm 'N' windows in the same record measured
+# 103-144bpm, correctly well below). `VT_RATE_THRESHOLD_BPM=150.0` is the LOW
+# end of the commonly-cited 150-180bpm range (per docs/shockable_rhythm_task.md
+# Part 0) — chosen for sensitivity, matching the AHA's own priority for this
+# decision (missing a shockable rhythm is worse than an unnecessary shock
+# advisory). A VT window whose estimated rate can't be computed (fewer than 2
+# detected peaks — can happen on a short/noisy segment) is DROPPED, not
+# guessed into either class.
+# --------------------------------------------------------------------------- #
+SHOCKABLE_NATIVE_FS = 250.0  # VFDB + CUDB, confirmed live (see Part 0 above)
+SHOCKABLE_WINDOW_SEC = 5.0
+SHOCKABLE_MIN_COVERAGE = 1.0
+VT_RATE_THRESHOLD_BPM = 150.0
+
+SHOCKABLE_RHYTHM_CODES = frozenset({"VF", "VFIB", "VFL"})
+NONSHOCKABLE_RHYTHM_CODES = frozenset({
+    "N", "NSR", "SBR", "NOD", "SVTA", "AFIB", "AF", "B", "BI", "VER", "PM",
+    "ASYS", "HGEA",
+})
+DROP_RHYTHM_CODES = frozenset({"NOISE"})
+VT_RHYTHM_CODE = "VT"
+
+VFDB_RECORDS = ("418", "419", "420", "421", "422", "423", "424", "425", "426",
+                 "427", "428", "429", "430", "602", "605", "607", "609", "610",
+                 "611", "612", "614", "615")
+CUDB_RECORDS = tuple(f"cu{i:02d}" for i in range(1, 36))
+
+
+def rhythm_code_to_shockable(code: str, vt_rate_bpm: float | None = None,
+                              vt_rate_threshold: float = VT_RATE_THRESHOLD_BPM
+                              ) -> int | None:
+    """Pure mapping, directly unit-testable on a literal code list (no
+    network/wfdb needed): a rhythm code (already stripped of the leading '('
+    and NUL padding, e.g. `'VF'`, `'N'`, `'VT'`) -> 1 (shockable), 0
+    (non-shockable), or `None` (drop — noise or an unrecognized code). See
+    the module-level "SHOCKABLE DEFINITION" comment above for the full rule
+    and its citation.
+
+    Args:
+        code: rhythm code string.
+        vt_rate_bpm: required to classify `VT_RHYTHM_CODE` — if `None`, a VT
+            code is dropped (`None` returned) rather than guessed into
+            either class.
+        vt_rate_threshold: bpm cutoff for "rapid" VT (default
+            `VT_RATE_THRESHOLD_BPM`).
+    """
+    if code in SHOCKABLE_RHYTHM_CODES:
+        return 1
+    if code in NONSHOCKABLE_RHYTHM_CODES:
+        return 0
+    if code == VT_RHYTHM_CODE:
+        if vt_rate_bpm is None:
+            return None
+        return 1 if vt_rate_bpm >= vt_rate_threshold else 0
+    return None  # DROP_RHYTHM_CODES (NOISE) and any unrecognized code
+
+
+def _rhythm_intervals_from_annotations(symbol: list, sample: list, aux_note: list,
+                                        sig_len: int) -> list:
+    """Pure function: raw wfdb annotation fields -> `[(start, end, code), ...]`
+    rhythm-episode intervals covering `[0, sig_len)`. Only `symbol == '+'`
+    entries carry rhythm `aux_note`s (see the module Part-0 comment above for
+    why this filter matters — CUDB's per-beat annotations use other symbols
+    and must be excluded first). Each episode runs from its own annotation's
+    sample to the NEXT rhythm annotation's sample (or `sig_len` for the last
+    one) — PhysioNet's VFDB documentation confirms "rhythm change annotations
+    are placed at the beginning of the episode of the indicated rhythm."
+    """
+    rhythm_idx = [i for i, s in enumerate(symbol) if s == "+"]
+    rsamples = [sample[i] for i in rhythm_idx]
+    rnotes = [aux_note[i].rstrip("\x00").lstrip("(") for i in rhythm_idx]
+    intervals = []
+    for i, code in enumerate(rnotes):
+        end = rsamples[i + 1] if i + 1 < len(rsamples) else sig_len
+        intervals.append((int(rsamples[i]), int(end), code))
+    return intervals
+
+
+def _dominant_rhythm(intervals: list, w_start: int, w_end: int,
+                      min_coverage: float = SHOCKABLE_MIN_COVERAGE) -> str | None:
+    """Pure function: the rhythm code covering the largest fraction of
+    `[w_start, w_end)`, or `None` if no interval overlaps the window at all,
+    OR the largest single code's coverage fraction is below `min_coverage`
+    (an ambiguous/transition window straddling a rhythm change — dropped,
+    per docs/shockable_rhythm_task.md's task framing). At the default
+    `min_coverage=1.0`, this means "no interval fully contains the window."
+    """
+    cov: dict = {}
+    total = w_end - w_start
+    if total <= 0:
+        return None
+    for (s, e, code) in intervals:
+        overlap = max(0, min(e, w_end) - max(s, w_start))
+        if overlap > 0:
+            cov[code] = cov.get(code, 0) + overlap
+    if not cov:
+        return None
+    code, covered = max(cov.items(), key=lambda kv: kv[1])
+    return code if (covered / total) >= min_coverage else None
+
+
+def _estimate_rate_bpm(seg: np.ndarray, fs: float) -> float:
+    """Lightweight per-window heart-rate estimate via band-pass + peak-
+    picking on the squared signal — NOT a diagnostic-grade QRS detector, only
+    accurate enough to discriminate "rapid" from "slow" VT (see the module
+    Part-0 comment above for validation against known-VT and known-normal
+    windows). Returns 0.0 if fewer than 2 peaks are found (segment too
+    short/flat to estimate a rate from).
+    """
+    from scipy.signal import butter, filtfilt, find_peaks
+    b, a = butter(2, [5.0, 25.0], btype="band", fs=fs)
+    filt = filtfilt(b, a, seg)
+    energy = filt ** 2
+    min_dist = max(1, int(round(0.2 * fs)))  # 200ms refractory -> <=300bpm ceiling
+    thresh = np.percentile(energy, 75)
+    peaks, _ = find_peaks(energy, distance=min_dist, height=thresh)
+    if len(peaks) < 2:
+        return 0.0
+    dur = (peaks[-1] - peaks[0]) / fs
+    return (len(peaks) - 1) / dur * 60.0 if dur > 0 else 0.0
+
+
+def _load_shockable_record(db: str, record: str, cache_dir: str):
+    """Stream (or load from cache) one VFDB/CUDB record's channel-0 signal +
+    rhythm-episode intervals. Caches to a `.npz` (gitignored `data/`) so
+    repeated runs don't re-hit the network.
+    """
+    import os
+    path = os.path.join(cache_dir, f"{db}_{record}.npz")
+    if os.path.exists(path):
+        d = np.load(path)
+        return (d["sig"], float(d["fs"]),
+                list(zip(d["starts"].tolist(), d["ends"].tolist(), d["codes"].tolist())))
+    import wfdb
+    os.makedirs(cache_dir, exist_ok=True)
+    sig, fields = wfdb.rdsamp(record, pn_dir=db, channels=[0])
+    ann = wfdb.rdann(record, "atr", pn_dir=db)
+    fs = float(fields["fs"])
+    intervals = _rhythm_intervals_from_annotations(
+        ann.symbol, ann.sample.tolist(), ann.aux_note, sig.shape[0])
+    x = sig[:, 0].astype(np.float32)
+    starts = np.array([iv[0] for iv in intervals], dtype=np.int64)
+    ends = np.array([iv[1] for iv in intervals], dtype=np.int64)
+    codes = np.array([iv[2] for iv in intervals], dtype="<U16")
+    np.savez(path, sig=x, fs=fs, starts=starts, ends=ends, codes=codes)
+    return x, fs, intervals
+
+
+def load_vfdb_cudb(
+    vfdb_records: tuple = VFDB_RECORDS,
+    cudb_records: tuple = CUDB_RECORDS,
+    window_sec: float = SHOCKABLE_WINDOW_SEC,
+    min_coverage: float = SHOCKABLE_MIN_COVERAGE,
+    vt_rate_threshold: float = VT_RATE_THRESHOLD_BPM,
+    resample_to: int | None = 500,
+    max_windows_per_record: int | None = 40,
+    cache_dir_vfdb: str = "data/vfdb",
+    cache_dir_cudb: str = "data/cudb",
+    seed: int = 0,
+    verbose: bool = True,
+    record_timeout_sec: float = 60.0,
+    retries: int = 1,
+) -> ShockableData:
+    """Stream VFDB + CUDB, window, and label shockable-vs-non-shockable —
+    see the module-level Part-0 comment block above for the full derivation
+    (dataset access, rhythm-code vocabulary, window duration/coverage
+    choice, the shockable rule + citation, and VT-rate handling).
+
+    Args:
+        vfdb_records/cudb_records: which records to pull (default: the full
+            confirmed 22 + 35).
+        window_sec: analysis-window duration at native 250 Hz (a capture
+            duration, not a Xylo/Akida timestep budget — see `resample_to`,
+            same decoupling as `load_mitbih`).
+        min_coverage: minimum fraction of a window one rhythm code must
+            cover to be labeled (default 1.0 = full containment — anything
+            straddling a rhythm change is dropped as ambiguous).
+        vt_rate_threshold: bpm cutoff for "rapid" (shockable) VT.
+        resample_to: FFT-resample each `window_sec*250` native-sample window
+            down to this many timesteps (default 500 = 5s at an effective
+            100 Hz — comfortably above VF's ~3-9 Hz dominant-frequency band
+            and a common downsampling target in published rhythm-
+            classification work; `None` keeps the native 1250 samples/window).
+        max_windows_per_record: cap on windows kept per record (a seeded
+            random subset) — keeps a few "busy" records from dominating the
+            dataset, same rationale as `load_cinc2016`'s
+            `max_windows_per_record`.
+        cache_dir_vfdb/cache_dir_cudb: per-record caches (gitignored `data/`).
+        seed: controls the random per-record window subsample.
+        verbose: print the pull plan and per-record progress.
+        record_timeout_sec/retries: `_call_with_timeout` wall-clock cap and
+            retry count per record (skip-and-continue, never hang).
+
+    Returns:
+        ShockableData with `source="vfdb_cudb"`, `groups` = record id per
+        window (ALWAYS set — split via `case_level.split_data`, never by
+        window).
+    """
+    try:
+        import wfdb  # noqa: F401  (import check; actual reads use wfdb.rdsamp/rdann)
+    except ImportError as e:  # pragma: no cover
+        raise ImportError("Install the data extra: pip install 'eia[data]'") from e
+
+    import time
+
+    rng = np.random.default_rng(seed)
+    win_native = int(round(window_sec * SHOCKABLE_NATIVE_FS))
+
+    plan = ([("vfdb", r, cache_dir_vfdb) for r in vfdb_records]
+            + [("cudb", r, cache_dir_cudb) for r in cudb_records])
+    if verbose:
+        print(f"[shockable] plan: {len(plan)} records "
+              f"({len(vfdb_records)} vfdb + {len(cudb_records)} cudb), "
+              f"window_sec={window_sec}, min_coverage={min_coverage}")
+
+    X_list, y_list, group_list = [], [], []
+    n_drop_ambig = n_drop_noise = n_drop_vt = 0
+    for i, (db, record, cache_dir) in enumerate(plan, 1):
+        t0 = time.time()
+        loaded, err = _call_with_timeout(
+            _load_shockable_record, record_timeout_sec, retries, db, record, cache_dir)
+        elapsed = time.time() - t0
+        if err is not None:
+            print(f"[warn] shockable {db}/{record}: failed to load ({err}) "
+                  f"after {elapsed:.0f}s; skipping record.")
+            continue
+        sig, fs, intervals = loaded
+        if not np.isfinite(sig).all():
+            print(f"[warn] shockable {db}/{record}: non-finite raw signal; skipping record.")
+            continue
+
+        n_windows = sig.shape[0] // win_native
+        win_idx = list(range(n_windows))
+        if max_windows_per_record is not None and len(win_idx) > max_windows_per_record:
+            win_idx = sorted(rng.choice(win_idx, size=max_windows_per_record,
+                                         replace=False).tolist())
+
+        kept = 0
+        for w in win_idx:
+            w_start, w_end = w * win_native, (w + 1) * win_native
+            code = _dominant_rhythm(intervals, w_start, w_end, min_coverage)
+            if code is None:
+                n_drop_ambig += 1
+                continue
+            if code in DROP_RHYTHM_CODES:
+                n_drop_noise += 1
+                continue
+            vt_rate = None
+            if code == VT_RHYTHM_CODE:
+                estimated = _estimate_rate_bpm(sig[w_start:w_end], fs)
+                # `_estimate_rate_bpm` returns 0.0, not None, when it can't
+                # find >=2 peaks -- treat that as "no estimate" here (drop),
+                # not as a genuinely slow rate (which would silently mislabel
+                # an unclassifiable window as non-shockable).
+                vt_rate = estimated if estimated > 0.0 else None
+            label = rhythm_code_to_shockable(code, vt_rate_bpm=vt_rate,
+                                              vt_rate_threshold=vt_rate_threshold)
+            if label is None:
+                n_drop_vt += 1
+                continue
+            X_list.append(sig[w_start:w_end])
+            y_list.append(label)
+            group_list.append(f"{db}:{record}")
+            kept += 1
+        if verbose:
+            print(f"[shockable] {db}/{record} ({i}/{len(plan)}): {kept} windows kept "
+                  f"in {elapsed:.1f}s, {len(X_list)} cumulative")
+
+    if not X_list:
+        raise RuntimeError("No shockable-rhythm windows extracted from VFDB/CUDB.")
+
+    X = np.stack(X_list).astype(np.float32)
+    if resample_to is not None and resample_to != win_native:
+        X = resample_windows(X, resample_to)
+        fs_eff = SHOCKABLE_NATIVE_FS * (resample_to / win_native)
+    else:
+        fs_eff = SHOCKABLE_NATIVE_FS
+    X = (X - X.mean(axis=1, keepdims=True)) / (X.std(axis=1, keepdims=True) + 1e-8)
+
+    y = np.array(y_list, dtype=np.int64)
+    n_shock = int(y.sum())
+    if verbose:
+        print(f"[shockable] done: {len(X_list)} windows "
+              f"({n_shock} shockable / {len(X_list) - n_shock} non-shockable, "
+              f"{n_shock / len(X_list):.1%} shockable); dropped "
+              f"{n_drop_ambig} ambiguous/transition, {n_drop_noise} noise, "
+              f"{n_drop_vt} unclassifiable-VT")
+
+    return ShockableData(X=X.astype(np.float32), y=y, fs=fs_eff, source="vfdb_cudb",
+                          groups=np.array(group_list, dtype=object))
+
+
+def _vf_window(n: int, rng: np.random.Generator, fs: float) -> np.ndarray:
+    """Stylised VF: chaotic, no organized QRS — a dominant-frequency
+    sinusoid in VF's typical 3-9 Hz band (see the module Part-0 comment
+    above) with phase jitter and additive noise, deliberately NOT a clinical
+    VF-morphology claim (same spirit as every other `make_synthetic_*`
+    generator here — a pipeline check, not real physiology).
+    """
+    t = np.arange(n) / fs
+    dom_freq = rng.uniform(3.0, 9.0)
+    phase_jitter = rng.uniform(0, 2 * np.pi, size=n) * 0.3
+    chaos = np.sin(2 * np.pi * dom_freq * t + phase_jitter)
+    return (chaos + rng.normal(0, 0.3, size=n)) * rng.uniform(0.5, 1.2)
+
+
+def _vt_window(n: int, rng: np.random.Generator, fs: float, hr_bpm: float) -> np.ndarray:
+    """Stylised VT: `_abnormal_beat`'s wide/bizarre QRS shape (already used
+    as ECG-arrhythmia's PVC-like beat) tiled at a RAPID, REGULAR rate —
+    unlike a single PVC amid normal rhythm, VT is sustained, organized, and
+    fast.
+    """
+    beat_len = max(4, int(round(60.0 / hr_bpm * fs)))
+    sig = np.zeros(n, dtype=np.float64)
+    onset = 0
+    while onset < n:
+        blen = min(beat_len, n - onset)
+        sig[onset:onset + blen] += _abnormal_beat(beat_len, rng)[:blen]
+        onset += beat_len
+    return sig
+
+
+def _organized_rhythm_window(n: int, rng: np.random.Generator, fs: float,
+                              hr_bpm: float) -> np.ndarray:
+    """Non-shockable stand-in: `_normal_beat`'s normal PQRST shape tiled at
+    `hr_bpm`. Real non-shockable rhythms cover many distinct patterns (see
+    the module Part-0 comment's `NONSHOCKABLE_RHYTHM_CODES`); this generator
+    is a pipeline check, not a claim of rhythm diversity.
+    """
+    beat_len = max(4, int(round(60.0 / hr_bpm * fs)))
+    sig = np.zeros(n, dtype=np.float64)
+    onset = 0
+    while onset < n:
+        blen = min(beat_len, n - onset)
+        sig[onset:onset + blen] += _normal_beat(beat_len, rng)[:blen]
+        onset += beat_len
+    return sig
+
+
+def make_synthetic_shockable(
+    n_samples: int = 2000,
+    window_sec: float = SHOCKABLE_WINDOW_SEC,
+    fs: float = 100.0,
+    shockable_frac: float = 0.3,
+    vt_frac_of_shockable: float = 0.5,
+    hr_normal_range: tuple = (60.0, 100.0),
+    hr_vt_range: tuple = (150.0, 220.0),
+    noise: float = 0.03,
+    seed: int = 0,
+) -> ShockableData:
+    """Generate a balanced-ish synthetic shockable-rhythm set: non-shockable
+    windows are an `_organized_rhythm_window` at a normal rate; shockable
+    windows are a mix of `_vf_window` (chaotic) and `_vt_window` (fast, wide,
+    regular QRS, rate drawn from `hr_vt_range` — always at/above
+    `VT_RATE_THRESHOLD_BPM` by construction, so every synthetic VT-like
+    window is genuinely shockable, no rate-threshold ambiguity to encode
+    here). `fs=100` (vs. VFDB/CUDB's native 250) matches this loader's own
+    default `resample_to` effective rate, so a model trained here has the
+    same input shape/scale as one trained on the real (resampled) data.
+    """
+    rng = np.random.default_rng(seed)
+    window = int(round(window_sec * fs))
+    X = np.empty((n_samples, window), dtype=np.float32)
+    y = np.empty((n_samples,), dtype=np.int64)
+    for i in range(n_samples):
+        if rng.random() < shockable_frac:
+            y[i] = 1
+            if rng.random() < vt_frac_of_shockable:
+                sig = _vt_window(window, rng, fs, rng.uniform(*hr_vt_range))
+            else:
+                sig = _vf_window(window, rng, fs)
+        else:
+            y[i] = 0
+            sig = _organized_rhythm_window(window, rng, fs, rng.uniform(*hr_normal_range))
+        sig = sig + rng.normal(0, noise, size=window)
+        sig = (sig - sig.mean()) / (sig.std() + 1e-8)
+        X[i] = sig.astype(np.float32)
+    return ShockableData(X=X, y=y, fs=fs, source="synthetic")
+
+
+def load_shockable(prefer_real: bool = True, require_real: bool = False,
+                    **kwargs) -> ShockableData:
+    """Load shockable-rhythm data, preferring real VFDB+CUDB but falling
+    back to synthetic. Mirrors `load_ecg`/`load_mi`'s provenance contract
+    exactly.
+
+    Args:
+        prefer_real: try `load_vfdb_cudb()` first.
+        require_real: if real data was requested and fails to load, raise
+            instead of silently substituting synthetic. Every allowed
+            fallback still prints a `[warn]` line naming the reason.
+        **kwargs: forwarded to `load_vfdb_cudb` when real; ignored when
+            falling back to synthetic.
+    """
+    if require_real and not prefer_real:
+        raise ValueError("require_real=True has no effect with prefer_real=False "
+                          "(nothing was asked to be real).")
+    if prefer_real:
+        try:
+            data = load_vfdb_cudb(**kwargs)
+            data.requested_real = True
+            return data
+        except Exception as e:  # noqa: BLE001  — any failure -> synthetic (or raise)
+            if require_real:
+                raise RuntimeError(
+                    f"--require-real: real VFDB/CUDB failed to load ({e}); "
+                    "refusing to silently substitute synthetic shockable-rhythm data."
+                ) from e
+            print(f"[warn] real VFDB/CUDB unavailable ({e}); falling back to "
+                  "synthetic shockable-rhythm data.")
+    data = make_synthetic_shockable()
     data.requested_real = prefer_real
     return data
 

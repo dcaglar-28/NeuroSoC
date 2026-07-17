@@ -1,5 +1,5 @@
 """Akida deployment & verification path (BrainChip MetaTF) — ECG (arrhythmia
-+ MI), heart sounds, and the synthetic CRM demo.
++ MI + shockable-rhythm), heart sounds, and the synthetic CRM demo.
 
 Deploy sibling of `rockpool_models.py` (which stays untouched). Where
 `rockpool_models.py` maps a Rockpool LIF SNN onto Xylo, this module builds
@@ -9,8 +9,9 @@ small **quantized Conv2D CNNs** and runs them on **MetaTF**: `quantizeml`
 sharing everything downstream (`quantize_and_convert`/`verify_against_sim`/
 `to_akida_input` are fully generic — no modality-specific shape assumptions):
   - `build_akida_model` (ECG-arrhythmia, and reused unchanged for the
-    synthetic CRM demo): a single-channel waveform reshaped to a
-    (window, 1, 1) single-column "image" — Conv2D-over-time, one real axis.
+    synthetic CRM demo and shockable-rhythm/VF-VT detection): a single-
+    channel waveform reshaped to a (window, 1, 1) single-column "image" —
+    Conv2D-over-time, one real axis.
   - `build_akida_heart_model` (heart sounds): the `signal_features`
     filterbank's `(n_features, n_subwindows)` map used AS a genuine 2-D
     image (bands x time), both axes real — see its docstring for why this

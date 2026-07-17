@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from eia import datasets
-from eia.datasets import CrmData, EcgData, HeartData, MiData, PpgData
+from eia.datasets import CrmData, EcgData, HeartData, MiData, PpgData, ShockableData
 
 
 def _fake_ecg(n=10):
@@ -560,3 +560,206 @@ def test_mi_per_lead_normalize_shape_compatible():
     assert Xtr_n.shape == Xtr.shape
     assert np.allclose(Xtr_n.mean(axis=(0, 2)), 0.0, atol=1e-5)
     assert np.allclose(Xtr_n.std(axis=(0, 2)), 1.0, atol=1e-5)
+
+
+# --------------------------------------------------------------------------- #
+# Shockable-rhythm (VF/VT) — docs/shockable_rhythm_task.md
+# --------------------------------------------------------------------------- #
+def test_rhythm_code_to_shockable_vf_family_is_shockable():
+    for code in ("VF", "VFIB", "VFL"):
+        assert datasets.rhythm_code_to_shockable(code) == 1
+
+
+def test_rhythm_code_to_shockable_nonshockable_codes():
+    for code in ("N", "NSR", "SBR", "NOD", "SVTA", "AFIB", "AF", "B", "BI",
+                  "VER", "PM", "ASYS", "HGEA"):
+        assert datasets.rhythm_code_to_shockable(code) == 0
+
+
+def test_rhythm_code_to_shockable_noise_is_dropped_not_nonshockable():
+    assert datasets.rhythm_code_to_shockable("NOISE") is None
+
+
+def test_rhythm_code_to_shockable_unknown_code_is_dropped():
+    assert datasets.rhythm_code_to_shockable("SOME_UNRECOGNIZED_CODE") is None
+
+
+def test_rhythm_code_to_shockable_vt_without_rate_is_dropped():
+    """VT can't be classified without a rate estimate -- must not guess."""
+    assert datasets.rhythm_code_to_shockable("VT") is None
+    assert datasets.rhythm_code_to_shockable("VT", vt_rate_bpm=None) is None
+
+
+def test_rhythm_code_to_shockable_rapid_vt_is_shockable():
+    assert datasets.rhythm_code_to_shockable("VT", vt_rate_bpm=200.0) == 1
+
+
+def test_rhythm_code_to_shockable_slow_vt_is_nonshockable():
+    assert datasets.rhythm_code_to_shockable("VT", vt_rate_bpm=100.0) == 0
+
+
+def test_rhythm_code_to_shockable_vt_rate_threshold_is_inclusive():
+    assert datasets.rhythm_code_to_shockable(
+        "VT", vt_rate_bpm=150.0, vt_rate_threshold=150.0) == 1
+
+
+def test_rhythm_code_to_shockable_custom_threshold():
+    assert datasets.rhythm_code_to_shockable(
+        "VT", vt_rate_bpm=160.0, vt_rate_threshold=180.0) == 0
+    assert datasets.rhythm_code_to_shockable(
+        "VT", vt_rate_bpm=190.0, vt_rate_threshold=180.0) == 1
+
+
+def test_rhythm_intervals_from_annotations_ignores_non_rhythm_symbols():
+    """Mirrors CUDB's real annotation structure (Part 0): most annotations
+    are per-beat markers (symbol != '+') with empty aux_note; only
+    symbol=='+' entries carry a rhythm code. Conflating them (an early bug
+    caught in Part 0) inflates episode counts with sub-second durations."""
+    symbol = ["N", "N", "+", "N", "N", "+", "N"]
+    sample = [10, 20, 30, 40, 50, 200, 210]
+    aux_note = ["", "", "(N\x00", "", "", "(VT\x00", ""]
+    intervals = datasets._rhythm_intervals_from_annotations(symbol, sample, aux_note, sig_len=300)
+    assert intervals == [(30, 200, "N"), (200, 300, "VT")]
+
+
+def test_rhythm_intervals_from_annotations_strips_parens_and_nul():
+    symbol = ["+", "+"]
+    sample = [0, 50]
+    aux_note = ["(VFIB\x00", "(N\x00"]
+    intervals = datasets._rhythm_intervals_from_annotations(symbol, sample, aux_note, sig_len=100)
+    assert intervals == [(0, 50, "VFIB"), (50, 100, "N")]
+
+
+def test_dominant_rhythm_full_containment():
+    intervals = [(0, 100, "N"), (100, 300, "VF"), (300, 400, "N")]
+    assert datasets._dominant_rhythm(intervals, 100, 300, min_coverage=1.0) == "VF"
+
+
+def test_dominant_rhythm_straddling_window_dropped_at_full_coverage():
+    """A window straddling a rhythm change is ambiguous/transition -- must
+    be dropped (None), not force-labeled with whichever code covers more."""
+    intervals = [(0, 160, "N"), (160, 400, "VF")]
+    # window [100,300): N covers [100,160)=60, VF covers [160,300)=140.
+    assert datasets._dominant_rhythm(intervals, 100, 300, min_coverage=1.0) is None
+
+
+def test_dominant_rhythm_majority_code_returned_below_full_coverage():
+    intervals = [(0, 160, "N"), (160, 400, "VF")]
+    # window [100,300): N=60/200=0.30, VF=140/200=0.70
+    assert datasets._dominant_rhythm(intervals, 100, 300, min_coverage=0.6) == "VF"
+    assert datasets._dominant_rhythm(intervals, 100, 300, min_coverage=0.8) is None
+
+
+def test_dominant_rhythm_no_overlap_is_none():
+    intervals = [(0, 100, "N")]
+    assert datasets._dominant_rhythm(intervals, 200, 300) is None
+
+
+def test_dominant_rhythm_empty_intervals_is_none():
+    assert datasets._dominant_rhythm([], 0, 100) is None
+
+
+def test_estimate_rate_bpm_recovers_known_pulse_rate():
+    """A synthetic narrow-pulse train at a KNOWN rate should be recovered
+    within a generous tolerance -- confirms the peak-picker's rate estimate
+    is at least directionally sane (not a diagnostic-grade claim, see
+    docs/shockable_rhythm_task.md's Part-0 validation against real VFDB
+    windows)."""
+    fs = 250.0
+    true_bpm = 200.0
+    period = 60.0 / true_bpm
+    n = int(5 * fs)
+    t = np.arange(n) / fs
+    sig = np.zeros(n)
+    pulse_times = np.arange(0, 5.0, period)
+    for pt in pulse_times:
+        idx = int(round(pt * fs))
+        width = max(1, int(0.01 * fs))
+        lo, hi = max(0, idx - width), min(n, idx + width)
+        sig[lo:hi] += np.hanning(hi - lo)
+    rate = datasets._estimate_rate_bpm(sig, fs)
+    assert abs(rate - true_bpm) / true_bpm < 0.2
+
+
+def test_estimate_rate_bpm_flat_signal_returns_zero():
+    fs = 250.0
+    sig = np.zeros(int(2 * fs))
+    assert datasets._estimate_rate_bpm(sig, fs) == 0.0
+
+
+def test_make_synthetic_shockable_shape_dtype_and_no_groups():
+    d = datasets.make_synthetic_shockable(n_samples=200, seed=0)
+    assert d.X.ndim == 2
+    assert d.X.shape[0] == 200
+    assert d.X.dtype == np.float32
+    assert d.y.dtype == np.int64
+    assert set(np.unique(d.y).tolist()) <= {0, 1}
+    assert d.groups is None  # no natural record grouping for synthetic samples
+    assert d.source == "synthetic"
+
+
+def test_make_synthetic_shockable_per_window_normalized():
+    d = datasets.make_synthetic_shockable(n_samples=50, seed=0)
+    assert np.allclose(d.X.mean(axis=1), 0.0, atol=1e-4)
+    assert np.allclose(d.X.std(axis=1), 1.0, atol=1e-2)
+
+
+def test_make_synthetic_shockable_shockable_is_minority_by_default():
+    d = datasets.make_synthetic_shockable(n_samples=1000, seed=0)
+    assert 0.0 < d.y.mean() < 0.5
+
+
+def test_shockable_default_is_synthetic_and_not_requested_real():
+    d = datasets.load_shockable(prefer_real=False, n_samples=20)
+    assert d.source == "synthetic"
+    assert d.requested_real is False
+
+
+def test_shockable_real_success_sets_requested_real_and_real_source():
+    fake = ShockableData(X=np.zeros((5, 500), dtype="float32"),
+                           y=np.zeros(5, dtype="int64"), fs=100.0, source="vfdb_cudb",
+                           groups=np.array(["vfdb:418"] * 5, dtype=object))
+    with patch.object(datasets, "load_vfdb_cudb", return_value=fake):
+        d = datasets.load_shockable(prefer_real=True)
+        assert d.source == "vfdb_cudb"
+        assert d.requested_real is True
+        assert d.groups is not None
+
+
+def test_shockable_real_failure_falls_back_but_marks_requested_real():
+    with patch.object(datasets, "load_vfdb_cudb", side_effect=RuntimeError("no network")):
+        d = datasets.load_shockable(prefer_real=True, require_real=False, n_samples=10)
+        assert d.source == "synthetic"
+        assert d.requested_real is True
+
+
+def test_shockable_require_real_raises_instead_of_falling_back():
+    with patch.object(datasets, "load_vfdb_cudb", side_effect=RuntimeError("no network")):
+        with pytest.raises(RuntimeError, match="require-real"):
+            datasets.load_shockable(prefer_real=True, require_real=True)
+
+
+def test_shockable_require_real_without_prefer_real_is_a_usage_error():
+    with pytest.raises(ValueError):
+        datasets.load_shockable(prefer_real=False, require_real=True)
+
+
+def test_shockable_no_leakage_record_split():
+    """Mirrors the mi/crm no-leakage tests: a ShockableData with several
+    windows per record (VFDB/CUDB records are different patients) must never
+    straddle a record across train/val/test."""
+    from eia import case_level
+    rng = np.random.default_rng(0)
+    n_records = 15
+    windows_per_record = 6
+    n = n_records * windows_per_record
+    record_ids = [f"vfdb:{i}" for i in range(n_records)]
+    groups = np.array([record_ids[i // windows_per_record] for i in range(n)], dtype=object)
+    d = ShockableData(X=rng.normal(size=(n, 500)).astype("float32"),
+                        y=rng.integers(0, 2, size=n).astype("int64"),
+                        fs=100.0, source="vfdb_cudb", groups=groups)
+    _Xtr, _Xval, _Xte, _ytr, _yval, _yte, gtr, gval, gte = case_level.split_data(d, seed=0)
+    tr_s, val_s, te_s = set(gtr.tolist()), set(gval.tolist()), set(gte.tolist())
+    assert not (tr_s & val_s)
+    assert not (tr_s & te_s)
+    assert not (val_s & te_s)

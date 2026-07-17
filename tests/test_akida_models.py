@@ -178,6 +178,35 @@ def test_crm_reuses_build_akida_model_unchanged_end_to_end():
     assert 0.0 <= res["agreement_rate"] <= 1.0
 
 
+def test_shockable_reuses_build_akida_model_unchanged_end_to_end():
+    """Shockable-rhythm (VF/VT) does NOT get its own builder (like CRM,
+    docs/shockable_rhythm_task.md: reuse the ECG waveform -> Akida CNN path,
+    not heart's/mi's genuinely-2-D filterbank/lead map -- VF/VT is a
+    single-lead morphology/rhythm signal) -- confirms `build_akida_model`
+    (unmodified) converts and runs on the real `make_synthetic_shockable`
+    data shape, end to end."""
+    pytest.importorskip("akida")
+    import tf_keras
+
+    from eia.datasets import make_synthetic_shockable
+
+    d = make_synthetic_shockable(n_samples=24, window_sec=5.0, fs=50.0, seed=0)
+    X = am.to_akida_input(d.X)
+    y = d.y
+
+    model = am.build_akida_model(window=d.X.shape[1], n_classes=2)
+    assert model.input_shape == (None, d.X.shape[1], 1, 1)
+    model.compile(optimizer="adam",
+                   loss=tf_keras.losses.SparseCategoricalCrossentropy(from_logits=True))
+    model.fit(X, y, epochs=1, batch_size=8, verbose=0)
+
+    _qmodel, akida_model = am.quantize_and_convert(model, X[:12], num_samples=12, batch_size=8)
+    res = am.verify_against_sim(model, akida_model, X[:8])
+    assert res["pred_float"].shape == (8,)
+    assert res["pred_akida"].shape == (8,)
+    assert 0.0 <= res["agreement_rate"] <= 1.0
+
+
 def test_build_akida_mi_model_shapes():
     pytest.importorskip("akida")
     model = am.build_akida_mi_model(n_leads=12, n_samples=1000, n_classes=2)

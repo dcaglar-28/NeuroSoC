@@ -1,13 +1,14 @@
 """Pre-hardware acceptance check for the Akida path — ECG arrhythmia, ECG
-myocardial infarction (PTB-XL), heart sounds, and the synthetic CRM/occult-
-hemorrhage demo (docs/akida_retarget_task.md, docs/synthetic_crm_task.md,
-docs/ptbxl_mi_task.md). Parallels `xylo_verify.py`'s per-modality train ->
-quantize -> verify-against-sim -> footprint structure, but for BrainChip
-MetaTF (`eia.akida_models`) instead of Rockpool/XyloSim. Reuses
-`datasets.load_ecg`/`load_heart`/`load_crm`/`load_mi`, `signal_features`
-(heart's filterbank front-end, also reused for mi's per-lead norm),
-`report`, and `case_level.split_data` — the exact same data/split/
-provenance discipline as the Xylo path.
+myocardial infarction (PTB-XL), heart sounds, the synthetic CRM/occult-
+hemorrhage demo, and shockable-rhythm (VF/VT) detection
+(docs/akida_retarget_task.md, docs/synthetic_crm_task.md,
+docs/ptbxl_mi_task.md, docs/shockable_rhythm_task.md). Parallels
+`xylo_verify.py`'s per-modality train -> quantize -> verify-against-sim ->
+footprint structure, but for BrainChip MetaTF (`eia.akida_models`) instead
+of Rockpool/XyloSim. Reuses `datasets.load_ecg`/`load_heart`/`load_crm`/
+`load_mi`/`load_shockable`, `signal_features` (heart's filterbank front-end,
+also reused for mi's per-lead norm), `report`, and `case_level.split_data` —
+the exact same data/split/provenance discipline as the Xylo path.
 
 **Linux only** (`akida` has no macOS wheel — see Dockerfile.akida). Run
 inside the container:
@@ -17,6 +18,7 @@ inside the container:
     scripts/akida_docker_run.sh python scripts/akida_verify.py --modality heart --real --n-seeds 5
     scripts/akida_docker_run.sh python scripts/akida_verify.py --modality crm --n-seeds 5
     scripts/akida_docker_run.sh python scripts/akida_verify.py --modality mi --real --n-seeds 5
+    scripts/akida_docker_run.sh python scripts/akida_verify.py --modality shockable --real --n-seeds 5
 
 Heart sounds is ALWAYS run with the filterbank front-end
 (`heart_frontend="features"`, `datasets.PCG_FEATURE_NAMES`/`PCG_BANDS`) —
@@ -31,15 +33,20 @@ not a spectral one; see docs/synthetic_crm_results.md. MI (PTB-XL) is also
 morphology, so ALSO raw-waveform (never the filterbank) — but genuinely
 2-D (12 leads x time, `build_akida_mi_model`), not a reuse of ECG-
 arrhythmia's single-column architecture; see docs/ptbxl_mi_task.md.
+Shockable-rhythm (VF/VT) is likewise a morphology/rhythm signal, so ALSO
+raw-waveform, and single-lead like ECG-arrhythmia/CRM — reuses
+`build_akida_model` unchanged (NOT a genuinely-2-D model like MI/heart);
+see docs/shockable_rhythm_task.md.
 
 See `src/eia/akida_models.py` for the confirmed Akida v2 layer constraints
 (square kernel/stride/pool, valid block-ordering patterns) this script's
 models rely on, `docs/akida_ecg_results.md` for the ECG-arrhythmia measured
 results, `docs/akida_heart_results.md` for heart sounds',
-`docs/synthetic_crm_results.md` for the CRM demo's, and
-`docs/ptbxl_mi_results.md` for MI's — including the Xylo-gap comparison and
-the Part-0 simulator-fidelity finding, shared across modalities, and (CRM
-only) the explicit synthetic/non-clinical caveat.
+`docs/synthetic_crm_results.md` for the CRM demo's, `docs/ptbxl_mi_results.md`
+for MI's, and `docs/shockable_rhythm_results.md` for shockable-rhythm's —
+including the Xylo-gap comparison and the Part-0 simulator-fidelity finding,
+shared across modalities, and (CRM only) the explicit synthetic/non-clinical
+caveat.
 """
 
 from __future__ import annotations
@@ -50,7 +57,7 @@ import copy
 import numpy as np
 
 from eia import case_level, report, signal_features
-from eia.datasets import load_crm, load_ecg, load_heart, load_mi
+from eia.datasets import load_crm, load_ecg, load_heart, load_mi, load_shockable
 
 
 def per_class_recall(preds: np.ndarray, y: np.ndarray, n_classes: int) -> list:
@@ -82,10 +89,12 @@ def _class_weight_dict(y: np.ndarray, n_classes: int) -> dict:
 
 def _build_model_for(modality: str, data_shape: tuple, n_classes: int):
     """Dispatch to the right `eia.akida_models` builder. `data_shape` is
-    `Xtr.shape[1:]` -- `(window,)` for ecg AND crm (crm reuses
-    `build_akida_model`'s waveform-over-time architecture unchanged: CRM is
-    a low-frequency pulse-MORPHOLOGY signal, the same class of input ECG's
-    architecture was built for, not heart's spectral filterbank map),
+    `Xtr.shape[1:]` -- `(window,)` for ecg, crm, AND shockable (crm and
+    shockable both reuse `build_akida_model`'s waveform-over-time
+    architecture unchanged: CRM is a low-frequency pulse-MORPHOLOGY signal
+    and shockable-rhythm VF/VT is likewise a morphology/rhythm signal, the
+    same class of input ECG's architecture was built for, not heart's
+    spectral filterbank map),
     `(n_features, n_subwindows)` for heart (post-split, pre-`to_akida_input`,
     matching `HeartData.X`'s `(n, n_features, n_subwindows)` convention),
     `(n_leads, n_samples)` for mi (matching `MiData.X`'s `(n, 12, 1000)`
@@ -93,7 +102,7 @@ def _build_model_for(modality: str, data_shape: tuple, n_classes: int):
     single-column reshape, since MI needs spatial lead information)."""
     from eia import akida_models as am
 
-    if modality in ("ecg", "crm"):
+    if modality in ("ecg", "crm", "shockable"):
         return am.build_akida_model(window=data_shape[0], n_classes=n_classes)
     if modality == "heart":
         n_features, n_subwindows = data_shape
@@ -300,16 +309,19 @@ def _load_data(modality: str, real: bool, require_real: bool):
         return load_crm(prefer_real=real, require_real=require_real)
     if modality == "mi":
         return load_mi(prefer_real=real, require_real=require_real)
+    if modality == "shockable":
+        return load_shockable(prefer_real=real, require_real=require_real)
     raise ValueError(f"unknown modality {modality!r}")
 
 
 def main():
     ap = argparse.ArgumentParser(
         description="Akida verification (ECG arrhythmia / ECG MI / heart sounds / CRM)")
-    ap.add_argument("--modality", choices=["ecg", "heart", "crm", "mi"], default="ecg")
+    ap.add_argument("--modality", choices=["ecg", "heart", "crm", "mi", "shockable"], default="ecg")
     ap.add_argument("--real", action="store_true",
                      help="use real data (MIT-BIH for ecg, CinC 2016 for heart, PTB-XL "
-                          "for mi) — needs network. No effect for crm (always synthetic).")
+                          "for mi, VFDB+CUDB for shockable) — needs network. No effect "
+                          "for crm (always synthetic).")
     ap.add_argument("--require-real", action="store_true")
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--qat-epochs", type=int, default=5,
