@@ -268,8 +268,8 @@ def map_and_quantize(net, method: str = "global"):
             (`build_combined_xylo_snn`), where two independently-trained
             sub-nets' weight magnitudes can differ, "global" wastes range on
             whichever sub-net is smaller — this is the exact failure mode
-            `docs/per_modality_xylo_verify_task.md` Part C warns about, and
-            "channel" is the documented fix.
+            co-residence quantization runs into, and "channel" is the
+            documented fix.
     """
     from rockpool.transform import quantize_methods as q
 

@@ -1,5 +1,5 @@
 """Case-aggregation logic: tiny synthetic per-window scores + group ids ->
-one score per group. No torch/network — see docs/vitaldb_case_level_task.md."""
+one score per group. No torch/network — see docs/vitaldb_case_level_results.md."""
 
 import numpy as np
 import pytest

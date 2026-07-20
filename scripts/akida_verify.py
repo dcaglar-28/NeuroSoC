@@ -1,8 +1,8 @@
 """Pre-hardware acceptance check for the Akida path — ECG arrhythmia, ECG
 myocardial infarction (PTB-XL), heart sounds, the synthetic CRM/occult-
 hemorrhage demo, and shockable-rhythm (VF/VT) detection
-(docs/akida_retarget_task.md, docs/synthetic_crm_task.md,
-docs/ptbxl_mi_task.md, docs/shockable_rhythm_task.md). Parallels
+(docs/akida_ecg_results.md, docs/synthetic_crm_results.md,
+docs/ptbxl_mi_results.md, docs/shockable_rhythm_task.md). Parallels
 `xylo_verify.py`'s per-modality train -> quantize -> verify-against-sim ->
 footprint structure, but for BrainChip MetaTF (`eia.akida_models`) instead
 of Rockpool/XyloSim. Reuses `datasets.load_ecg`/`load_heart`/`load_crm`/
@@ -32,7 +32,7 @@ NOT heart's filterbank — CRM is a low-frequency pulse-MORPHOLOGY signal,
 not a spectral one; see docs/synthetic_crm_results.md. MI (PTB-XL) is also
 morphology, so ALSO raw-waveform (never the filterbank) — but genuinely
 2-D (12 leads x time, `build_akida_mi_model`), not a reuse of ECG-
-arrhythmia's single-column architecture; see docs/ptbxl_mi_task.md.
+arrhythmia's single-column architecture; see docs/ptbxl_mi_results.md.
 Shockable-rhythm (VF/VT) is likewise a morphology/rhythm signal, so ALSO
 raw-waveform, and single-lead like ECG-arrhythmia/CRM — reuses
 `build_akida_model` unchanged (NOT a genuinely-2-D model like MI/heart);
@@ -303,7 +303,7 @@ def _load_data(modality: str, real: bool, require_real: bool):
                            heart_frontend="features")
     if modality == "crm":
         # ALWAYS synthetic -- load_crm has no real branch (real LBNP/CRM-
-        # induction data is gated, see docs/synthetic_crm_task.md); --real
+        # induction data is gated, see docs/synthetic_crm_results.md); --real
         # is accepted for CLI symmetry (recorded honestly in
         # `requested_real`) and --require-real raises immediately.
         return load_crm(prefer_real=real, require_real=require_real)

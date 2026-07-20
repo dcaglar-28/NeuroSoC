@@ -1,6 +1,6 @@
 # Synthetic time-resolved CRM / occult-hemorrhage demo — results
 
-Implements `docs/synthetic_crm_task.md`: the flagship differentiated
+The flagship differentiated
 capability — detecting compensated hemorrhage *before* heart rate moves —
 demonstrated with a physiologically-grounded synthetic generator, since real
 LBNP/CRM-induction data is gated. Reuses the ECG Akida-CNN path
@@ -177,8 +177,7 @@ and (2) the time-aligned label design is learnable, including the occult
 even the ones with threshold-calibration trouble, confirms the model is
 using morphology, not an HR proxy, to separate the classes. It does **not**
 demonstrate real-world occult-hemorrhage detection accuracy; that requires
-the gated LBNP/CRM-induction data noted in `docs/synthetic_crm_task.md` and
-CLAUDE.md's M-branch. The bimodal-seed finding above is a genuine, reported
+the gated LBNP/CRM-induction data noted in CLAUDE.md's M-branch. The bimodal-seed finding above is a genuine, reported
 limitation of this specific measurement (3-restart float convergence
 robustness on a richer signal), not swept under the mean.
 
@@ -199,7 +198,7 @@ scripts/akida_docker_run.sh python scripts/akida_verify.py --modality crm --n-se
 ## Next steps (noted, not built here)
 
 - Real validation needs gated LBNP/CRM-induction data (request access
-  separately, per `docs/synthetic_crm_task.md`).
+  separately — see `docs/lbnp_data_request_emails.md`).
 - A graded (3-stage) or true CRI-regression variant — `CrmData.cri` (the
   continuous ground truth) is already generated and stored for exactly
   this, unused by the current binary classifier.

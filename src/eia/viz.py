@@ -104,7 +104,7 @@ def plot_class_balance(data):
 
 def plot_crm_lead_effect(windows_per_subject: int = 24, hr_baseline: float = 70.0,
                           window_sec: float = 3.0, fs: float = 100.0, seed: int = 0):
-    """Demonstrate the CRM "lead effect" (docs/synthetic_crm_task.md) on one
+    """Demonstrate the CRM "lead effect" (docs/synthetic_crm_results.md) on one
     synthetic subject's trajectory: pulse MORPHOLOGY degrades from the very
     start of the decline, while heart rate stays flat at baseline until
     reserve drops well below the "compromised" label threshold — i.e. a

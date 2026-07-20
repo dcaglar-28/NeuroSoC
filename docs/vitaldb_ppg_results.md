@@ -1,9 +1,10 @@
 # VitalDB PPG hemorrhage task — measured results
 
-Implements `docs/vitaldb_ppg_hemorrhage_task.md`. This is the multi-seed
+This is the multi-seed
 float + XyloSim report for the new real, open, case-level blood-loss label
-(VitalDB `intraop_ebl`), reported on its own per the guiding principle in
-`docs/real_hemorrhage_dataset_task.md` (never pooled with BIDMC/synthetic).
+(VitalDB `intraop_ebl`), reported on its own per the guiding principle that
+each hemorrhage dataset is trained/evaluated separately (never pooled with
+BIDMC/synthetic).
 
 ## Part 0 — field/track verification (done before writing any loader code)
 
@@ -116,8 +117,8 @@ spread *is* the finding, not any one row of the per-seed table.
 
 - **Does establish:** the loader, case-level split, provenance guarding, data
   card + caveats, and multi-seed reporting all work correctly end-to-end on a
-  real, open, genuinely hemorrhage-relevant label — the infrastructure asked
-  for in `docs/vitaldb_ppg_hemorrhage_task.md` is complete and correct.
+  real, open, genuinely hemorrhage-relevant label — the intended
+  infrastructure is complete and correct.
 - **Does not establish:** that a single 4-second PPG window predicts
   case-level blood loss. The honest finding is that it barely does, with this
   label granularity. Follow-up options if this is revisited: aggregate

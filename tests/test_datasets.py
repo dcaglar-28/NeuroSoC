@@ -178,7 +178,7 @@ def test_heart_require_real_without_prefer_real_is_a_usage_error():
 
 
 def test_heart_groups_is_none_subject_ids_not_recoverable():
-    # Part 0 finding (docs/heart_sounds_task.md): CinC 2016 does not expose a
+    # Part 0 finding (docs/heart_sounds_results.md): CinC 2016 does not expose a
     # subject id in any distributed file, so the split is by recording, not
     # subject -- documented here as an explicit contract, not a silent gap.
     d = datasets.make_synthetic_heart(n_samples=10)
@@ -209,7 +209,7 @@ def test_bandpass_filter_attenuates_out_of_band_signal():
 # --------------------------------------------------------------------------- #
 # Generic helpers used by heart sounds (originally added for EEG, but not
 # EEG-specific -- kept here so their coverage survives EEG code removal;
-# see docs/heart_sounds_task.md Part B).
+# see docs/heart_sounds_results.md Part B).
 # --------------------------------------------------------------------------- #
 def test_resample_windows_2d_and_3d():
     X2 = np.random.default_rng(0).normal(size=(4, 100))
@@ -282,7 +282,7 @@ def test_call_with_timeout_gives_up_after_exhausting_retries():
 
 
 # --------------------------------------------------------------------------- #
-# CRM (synthetic time-resolved Compensatory Reserve) — docs/synthetic_crm_task.md
+# CRM (synthetic time-resolved Compensatory Reserve) — docs/synthetic_crm_results.md
 # --------------------------------------------------------------------------- #
 def test_reserve_trajectory_is_monotonically_non_increasing():
     rng = np.random.default_rng(0)
@@ -416,10 +416,10 @@ def test_crm_require_real_always_raises():
 
 
 # --------------------------------------------------------------------------- #
-# MI (PTB-XL 12-lead myocardial infarction) — docs/ptbxl_mi_task.md
+# MI (PTB-XL 12-lead myocardial infarction) — docs/ptbxl_mi_results.md
 # --------------------------------------------------------------------------- #
 # A literal lookup mirroring scp_statements.csv's REAL structure (verified
-# live against the actual file, docs/ptbxl_mi_task.md Part 0) -- code ->
+# live against the actual file, docs/ptbxl_mi_results.md Part 0) -- code ->
 # diagnostic_class, already filtered to `diagnostic==1` rows. Real examples:
 # NORM is the sole NORM-class code; IMI/ASMI are real MI-class codes; NDT is
 # a real STTC-class code; SR/ABQRS/LVOLT are real but NON-diagnostic (no

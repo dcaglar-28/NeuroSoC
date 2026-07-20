@@ -1,4 +1,4 @@
-# Akida/MetaTF dev container (docs/akida_retarget_task.md). See the
+# Akida/MetaTF dev container (see docs/akida_ecg_results.md). See the
 # "Verify on Akida" section of README.md and scripts/akida_docker_run.sh for a
 # plain `docker` equivalent if you don't have the compose plugin installed.
 #

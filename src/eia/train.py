@@ -214,7 +214,7 @@ def main():
                          "for ecg). vitaldb = case-level intraop_ebl blood-"
                          "loss label; bidmc = SpO2-desaturation proxy "
                          "(unchanged default). See "
-                         "docs/vitaldb_ppg_hemorrhage_task.md.")
+                         "docs/vitaldb_ppg_results.md.")
     ap.add_argument("--sweep", action="store_true",
                     help="trace the accuracy/energy trade-off across settings")
     ap.add_argument("--epochs", type=int, default=10)

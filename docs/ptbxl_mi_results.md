@@ -2,7 +2,7 @@
 
 Deepens the ECG capability from *arrhythmia* (MIT-BIH, single-lead,
 per-beat, `docs/akida_ecg_results.md`) to *myocardial infarction*
-(PTB-XL, 12-lead, per-recording) — implements `docs/ptbxl_mi_task.md`.
+(PTB-XL, 12-lead, per-recording).
 This is a new task/dataset on the EXISTING ECG modality, not a new
 modality: `EcgData`/`load_ecg`/the ECG-arrhythmia Akida path
 (`build_akida_model`), heart sounds, the synthetic CRM demo, and
@@ -138,8 +138,8 @@ weights/activations.
 ## Verdict: the float model detects MI on real PTB-XL, at the benchmarked level
 
 **Float AUROC 0.890 ± 0.024 lands right at the literature's ~0.9+
-benchmarked range for PTB-XL MI-vs-NORM** (`docs/ptbxl_mi_task.md`'s stated
-expectation) — this is real, working myocardial-infarction detection on
+benchmarked range for PTB-XL MI-vs-NORM** (the stated expectation going in)
+— this is real, working myocardial-infarction detection on
 cardiologist-labeled 12-lead ECG, not a chance result. Per-class recall is
 genuine (0.852/0.737 mean, no majority collapse toward the 79%-prevalent
 NORM class) and consistent across all 5 seeds (recall for MI, the harder,

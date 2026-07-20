@@ -2,7 +2,7 @@
 
 Draft outreach to the two gated induced-hypovolemia (LBNP) PPG datasets that have
 the right physiology + time-resolved labels for the flagship occult-hemorrhage
-signal (see `docs/synthetic_crm_task.md` for the in-hand synthetic Track 1).
+signal (see `docs/synthetic_crm_results.md` for the in-hand synthetic Track 1).
 Research-first, non-commercial framing (gated clinical data is released far more
 readily to academic research than to a venture). Fill any remaining brackets and
 confirm current emails before sending.

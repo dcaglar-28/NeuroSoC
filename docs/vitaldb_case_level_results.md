@@ -1,6 +1,6 @@
 # VitalDB case-level hemorrhage classification — measured results
 
-Implements `docs/vitaldb_case_level_task.md`, the matched-granularity rescue
+The matched-granularity rescue
 of the per-window VitalDB result (`docs/vitaldb_ppg_results.md`: float
 balanced accuracy 0.509 ± 0.025, ~chance). `intraop_ebl` is a whole-case
 total, so a per-window prediction and a per-case label describe different

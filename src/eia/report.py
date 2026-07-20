@@ -141,7 +141,7 @@ _CARDS = {
         "hemorrhage-detection accuracy. Physiologically grounded (pulse "
         "amplitude/dicrotic-notch/width/diastolic-component relationships from "
         "the explainable-CRM literature, MDPI Bioeng. 2023) but real validation "
-        "needs gated LBNP/CRM-induction data — see docs/synthetic_crm_task.md "
+        "needs gated LBNP/CRM-induction data — see docs/synthetic_crm_results.md "
         "and docs/synthetic_crm_results.md. Split by SUBJECT (`groups`, always "
         "set) — windows within one trajectory are highly correlated.",
     ),

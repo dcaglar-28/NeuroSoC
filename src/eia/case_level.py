@@ -3,7 +3,7 @@
 For datasets where the ground-truth label is inherently case-level but the
 model consumes short windows (VitalDB: `intraop_ebl` is a single whole-case
 total stamped onto every window from that case — see
-`docs/vitaldb_case_level_task.md`), the statistically honest evaluation is one
+`docs/vitaldb_case_level_results.md`), the statistically honest evaluation is one
 prediction per case, not one per window. This module holds the two pure,
 torch-free pieces of that: pooling per-window scores into per-case scores, and
 splitting a windowed dataset by case (not window) so no case straddles

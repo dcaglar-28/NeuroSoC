@@ -5,7 +5,7 @@
 > paused pending a richer montage without the 16-input Xylo ceiling (Akida
 > headroom) and/or more patients. Recoverable from git history.
 
-Implements `docs/eeg_seizure_task.md` (MARCH "H", Phase 1). Part 1 is the
+MARCH "H", Phase 1. Part 1 is the
 subject-independent seizure-vs-non-seizure result for the new EEG modality —
 the second real-data workstream in this repo alongside ECG, reported on its
 own (never pooled with ECG/PPG results). Part 2 is the patient-specific
@@ -23,8 +23,7 @@ with (clinical targets are typically <1/hour).
 **The follow-up patient-specific diagnostic (Part 2, below) narrows down
 *why*: it is ALSO flat at chance (float balanced accuracy 0.517 +/- 0.074,
 AUROC 0.524 +/- 0.097) on the exact same records subject-independent was
-tested on.** Per the diagnostic's own decision rule
-(`docs/eeg_seizure_task.md`): patient-specific learning while
+tested on.** Per the diagnostic's own decision rule: patient-specific learning while
 subject-independent doesn't would mean "not enough cross-patient data";
 patient-specific ALSO failing on the same data — what actually happened —
 points at the **front-end** (6-channel montage / 0.5-25 Hz band-pass / 128
@@ -41,9 +40,9 @@ final.
 not be read the same way. VitalDB's conclusion was "the label itself does not
 carry a usable signal, at any granularity tried — stop revisiting it." CHB-MIT
 scalp EEG seizure detection is a well-established, decades-benchmarked
-learnable problem in the literature (that is why this task picked it — see
-`docs/eeg_seizure_task.md`'s framing: "strong physiology, excellent expert
-labels, decades of benchmarks"), so a genuine data-quality dead end is
+learnable problem in the literature (that is why this task picked it —
+"strong physiology, excellent expert labels, decades of benchmarks"), so a
+genuine data-quality dead end is
 unlikely — but this repo's own front-end choices (montage/band/timesteps) are
 now a live suspect alongside data volume, not a settled non-issue.
 
@@ -217,7 +216,7 @@ modestly above that, not a strong signal on its own.)
 
 ## Part 2 — patient-specific diagnostic (disambiguating scale vs. front-end)
 
-Implements the follow-up in `docs/eeg_seizure_task.md`: the subject-
+This follow-up exists because the subject-
 independent result alone can't tell "too little cross-patient data" apart
 from "the front-end destroyed the seizure signal" — both look identical from
 outside. The patient-specific diagnostic reuses the exact same pipeline

@@ -1,4 +1,4 @@
-# Akida/MetaTF dev container (docs/akida_retarget_task.md).
+# Akida/MetaTF dev container (see docs/akida_ecg_results.md).
 #
 # WHY A CONTAINER: BrainChip's `akida` package (the actual execution-engine /
 # software simulator -- everything else in MetaTF depends on it) publishes NO

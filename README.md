@@ -130,7 +130,7 @@ for the full writeup, including why a shorter encoding window helps synthetic
 ECG's XyloSim fidelity but does *not* transfer as-is to real MIT-BIH (different
 sampling rate — same window length is a different real-world duration).
 
-See `docs/xylo_verification_task.md` and `docs/per_modality_xylo_verify_task.md`
+See `rockpool_models.py` and `scripts/xylo_verify.py`
 for the full specs and known gotchas — this exact readout (2 output neurons,
 spike-count logits) is prone to a dead-neuron collapse that only a positive
 initial bias fixes, the official tutorial's `PeriodicExponential` surrogate
@@ -139,13 +139,15 @@ prior), and co-residence measurably costs some XyloSim fidelity vs. either
 modality's standalone number under a shared 8-bit weight budget. All
 documented in `rockpool_models.py` and `scripts/xylo_verify.py`.
 
-## Verify on Akida (committed production target — ECG first slice)
+## Verify on Akida (committed production target)
 
 BrainChip **Akida** (MetaTF toolchain) is the committed production silicon
 (see CLAUDE.md's "Hardware target"); this repo also validates on Rockpool/
 XyloSim (above) because it's a mature bit-exact simulator available today.
-`docs/akida_retarget_task.md` is the full re-target plan; this is its first,
-minimal slice — ECG only, everything else stays on the Xylo path untouched.
+See `docs/akida_ecg_results.md` for the first, minimal slice (ECG only);
+myocardial infarction, heart sounds, the synthetic CRM demo, and shockable-
+rhythm detection have since ported onto the same path (see each modality's
+own `docs/*_results.md`) — the Xylo path above stays untouched throughout.
 
 **Linux only — needs a container.** BrainChip's `akida` package (the actual
 execution-engine / software simulator) publishes no macOS wheel, in any of
@@ -256,7 +258,7 @@ git push -u origin main
   conscious-hemorrhage ground truth: patients are anesthetized (confounds PPG),
   EBL is a whole-case estimate (not time-aligned to the bleed), and it's split
   **by case, not window** (`PpgData.groups`) since many correlated windows share
-  one case-level label. See `docs/vitaldb_ppg_hemorrhage_task.md` for the full
+  one case-level label. See `docs/vitaldb_ppg_results.md` for the full
   write-up and Part-0 field-name verification. BIDMC stays as a secondary real-
   PPG dataset (kept, not deleted). The synthetic PPG generator
   (`make_synthetic_ppg`) remains closest in spirit to the actual target: reduced

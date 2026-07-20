@@ -7,9 +7,7 @@ mapped resource footprint), then — when both modalities are run — combines
 the two independently-trained nets onto one Xylo core and confirms neither
 modality's decisions are corrupted by co-residence and shared quantization.
 
-See `docs/xylo_verification_task.md` (per-modality basics) and
-`docs/per_modality_xylo_verify_task.md` (this script's spec) for the full
-task write-ups, including the two empirical findings that shape the training
+Two empirical findings shape the training
 code below: this net's spike-count readout only trains reliably with a
 positive initial bias (see `rockpool_models.build_xylo_snn`), and the
 official tutorial's `PeriodicExponential` surrogate measurably regresses
@@ -23,9 +21,9 @@ Run from the repo root (needs `pip install "eia[xylo]"`):
     python scripts/xylo_verify.py --real               # real MIT-BIH / BIDMC (needs wfdb + network)
     python scripts/xylo_verify.py --modality ppg --real --ppg-source vitaldb \
         --n-seeds 5                                    # real VitalDB blood-loss label, multi-seed
-        (needs `pip install "eia[data]"`; see docs/vitaldb_ppg_hemorrhage_task.md)
+        (needs `pip install "eia[data]"`; see docs/vitaldb_ppg_results.md)
     python scripts/xylo_verify.py --modality heart --real --n-seeds 5
-        # real PhysioNet/CinC 2016 heart sounds, multi-seed — see docs/heart_sounds_task.md
+        # real PhysioNet/CinC 2016 heart sounds, multi-seed — see docs/heart_sounds_results.md
 """
 
 from __future__ import annotations
@@ -189,7 +187,7 @@ def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
     Xtr, Xval, Xte, ytr, yval, yte, _groups_tr, _groups_val, _groups_te = \
         split_fn(data, seed)
 
-    # Feature front-end (docs/heart_sounds_task.md's escalation path,
+    # Feature front-end (docs/heart_sounds_results.md's escalation path,
     # originally built for EEG's — retired — feature front-end): X holds RAW
     # feature values out of the loader (line length is in raw signal units,
     # band power is a [0,1] fraction, spectral entropy is [0,1] -- wildly
@@ -279,7 +277,7 @@ def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
 def _binary_extra_metrics(y_t, preds, scores: np.ndarray, window_sec: float) -> dict:
     """Sensitivity/specificity/AUROC/AUPRC/false-alarms-per-hour for an
     imbalanced binary modality (originally added for EEG seizure detection,
-    docs/eeg_seizure_task.md; reused by heart-sound abnormal/normal since
+    docs/eeg_seizure_results.md; reused by heart-sound abnormal/normal since
     that's imbalanced too, ~20.5% abnormal) — reported INSTEAD OF accuracy
     since per-class recall alone doesn't give a threshold-free ranking
     measure, hence AUROC/AUPRC. `scores` is a continuous positive-class score
@@ -355,7 +353,7 @@ def verify_modality(result: dict, max_verify: int) -> dict:
     if modality == "heart" and n_classes == 2:
         # Accuracy is misleading under heart's moderate imbalance (~20.5%
         # abnormal) — report the threshold-free ranking metrics instead
-        # (docs/heart_sounds_task.md; this helper originally shipped for
+        # (docs/heart_sounds_results.md; this helper originally shipped for
         # EEG's more extreme imbalance, see _binary_extra_metrics).
         window_sec = result["window_sec"]
         float_probs = torch.softmax(
@@ -554,7 +552,7 @@ def main():
     ap.add_argument("--ppg-source", choices=["bidmc", "vitaldb"], default="bidmc",
                      help="which real dataset backs the ppg modality (ignored "
                           "for ecg). vitaldb = case-level intraop_ebl blood-"
-                          "loss label (see docs/vitaldb_ppg_hemorrhage_task.md); "
+                          "loss label (see docs/vitaldb_ppg_results.md); "
                           "bidmc = SpO2-desaturation proxy (unchanged default).")
     ap.add_argument("--max-cases", type=int, default=None,
                      help="vitaldb only: subset of qualifying cases to pull "

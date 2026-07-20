@@ -2,9 +2,9 @@
 front-end (`eia.signal_features`) -- line length, relative band power,
 spectral entropy, train-only normalization. Pure NumPy/SciPy, no network.
 
-Originally exercised via EEG's bands (docs/eeg_frontend_task.md, retired);
+Originally exercised via EEG's bands (docs/eeg_frontend_results.md, retired);
 these tests use an arbitrary example band dict since the module itself makes
-no domain assumptions (see docs/heart_sounds_task.md for the current user,
+no domain assumptions (see docs/heart_sounds_results.md for the current user,
 heart-sound murmur detection)."""
 
 import numpy as np

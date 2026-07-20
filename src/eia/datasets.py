@@ -38,7 +38,7 @@ class MiData:
     per-beat) to MI (12-lead, per-recording). Its OWN dataclass, not a reuse
     of `EcgData`, because the shape genuinely differs: MI needs spatial
     lead information (`(leads, time)`, 2-D per sample), not a single-lead
-    beat window — see docs/ptbxl_mi_task.md."""
+    beat window — see docs/ptbxl_mi_results.md."""
     X: np.ndarray  # (n_samples, 12, 1000) float32 — 12-lead PTB-XL recording,
                     # 100 Hz, 10 s, RAW mV (not yet normalized — per-lead
                     # z-score is fit on the TRAIN split only, post-split, via
@@ -57,7 +57,7 @@ class MiData:
     # split by group (`case_level.split_data`), never by record — a
     # `strat_fold`-equivalent guarantee via `GroupShuffleSplit` on this
     # field, confirmed against PTB-XL's own shipped `strat_fold` column to
-    # give the same patient-disjointness property (see docs/ptbxl_mi_task.md
+    # give the same patient-disjointness property (see docs/ptbxl_mi_results.md
     # Part 0).
     groups: np.ndarray | None = None
 
@@ -73,7 +73,7 @@ class HeartData:
     requested_real: bool = False
     # Subject id per window, when recoverable. CinC 2016's distributed files
     # (RECORDS/REFERENCE.csv/.hea headers — verified, not guessed; see
-    # docs/heart_sounds_task.md Part 0) do NOT expose a subject id, even
+    # docs/heart_sounds_results.md Part 0) do NOT expose a subject id, even
     # though the dataset's own documentation confirms one subject may
     # contribute 1-6 recordings — so this is always None for "cinc2016" and
     # the split is by RECORDING, not by subject (documented caveat, not a
@@ -82,7 +82,7 @@ class HeartData:
     # change.
     groups: np.ndarray | None = None
     # "raw" (default, delta-encoded waveform, per-window self-normalized —
-    # X is (n_samples, window)) or "features" (docs/heart_sounds_task.md's
+    # X is (n_samples, window)) or "features" (docs/heart_sounds_results.md's
     # escalation path: raw delta came back ~chance, murmurs are spectral —
     # line length / relative band power / spectral entropy per sub-window
     # via `eia.signal_features`, X becomes (n_samples, n_features,
@@ -138,7 +138,7 @@ class ShockableData:
 @dataclass
 class CrmData:
     """A synthetic, TIME-RESOLVED Compensatory Reserve trajectory dataset —
-    see docs/synthetic_crm_task.md. Same 2-D (n_samples, window) PPG-shaped
+    see docs/synthetic_crm_results.md. Same 2-D (n_samples, window) PPG-shaped
     convention as `PpgData` (deliberately its own dataclass, not a reuse of
     `PpgData`, only because it needs one extra field, `cri`, that no other
     PPG source has: the continuous ground-truth reserve value, not just the
@@ -149,7 +149,7 @@ class CrmData:
     fs: float       # sampling rate (Hz)
     source: str     # "synthetic" ONLY — no real loader exists (real LBNP/
                      # CRM-induction data is gated; see
-                     # docs/synthetic_crm_task.md). Never claim this is a
+                     # docs/synthetic_crm_results.md). Never claim this is a
                      # clinical accuracy number — see `report._CARDS`.
     requested_real: bool = False
     # Synthetic SUBJECT id per window — ALWAYS set (unlike other synthetic
@@ -164,7 +164,7 @@ class CrmData:
     # VitalDB's one-whole-case-EBL-number-stamped-on-every-window flaw this
     # generator exists to fix — kept for unit-testing the alignment
     # property directly and as the target for a future CRI-regression
-    # variant (not built here, see docs/synthetic_crm_task.md).
+    # variant (not built here, see docs/synthetic_crm_results.md).
     cri: np.ndarray | None = None
 
 
@@ -343,7 +343,7 @@ def load_ecg(prefer_real: bool = True, require_real: bool = False,
 
 # --------------------------------------------------------------------------- #
 # Myocardial infarction (12-lead ECG, PTB-XL) — deepens ECG from arrhythmia
-# to MI/ischemia (docs/ptbxl_mi_task.md). Real loader + synthetic fallback.
+# to MI/ischemia (docs/ptbxl_mi_results.md). Real loader + synthetic fallback.
 # --------------------------------------------------------------------------- #
 def _mi_beat_leads(n: int, rng: np.random.Generator, is_mi: bool,
                     n_leads: int = 12) -> np.ndarray:
@@ -407,7 +407,7 @@ def make_synthetic_mi(
 
 PTBXL_VERSION = "1.0.3"
 PTBXL_LEADS = ("I", "II", "III", "AVR", "AVL", "AVF", "V1", "V2", "V3", "V4", "V5", "V6")
-PTBXL_NATIVE_FS = 100.0  # records100/ -- confirmed live, docs/ptbxl_mi_task.md Part 0
+PTBXL_NATIVE_FS = 100.0  # records100/ -- confirmed live, docs/ptbxl_mi_results.md Part 0
 
 
 def _fetch_ptbxl_index(cache_dir: str, timeout_sec: float = 60.0) -> "pd.DataFrame":
@@ -417,7 +417,7 @@ def _fetch_ptbxl_index(cache_dir: str, timeout_sec: float = 60.0) -> "pd.DataFra
     `label` (1=MI, 0=NORM).
 
     **Label rule (verified against PTB-XL's own shipped `example_physionet.py`,
-    not guessed — docs/ptbxl_mi_task.md Part 0):** `scp_codes` is a
+    not guessed — docs/ptbxl_mi_results.md Part 0):** `scp_codes` is a
     stringified `{SCP_code: likelihood}` dict; likelihood `0.0` means
     "present but not confidence-scored" — NOT "absent" — so, matching the
     dataset's own official aggregation example, we do NOT threshold by
@@ -714,7 +714,7 @@ def make_synthetic_heart(
 CINC2016_SETS = ("a", "b", "c", "d", "e", "f")
 CINC2016_NATIVE_FS = 2000.0
 
-# Bands for the "features" front-end (docs/heart_sounds_task.md's escalation
+# Bands for the "features" front-end (docs/heart_sounds_results.md's escalation
 # path: raw delta-encoding measured ~chance, and a murmur is a spectral/
 # turbulent-flow signature within the 20-400 Hz PCG band, not an edge — see
 # `eia.signal_features`). "low" ~ S1/S2 fundamental energy; "high" ~ where
@@ -742,7 +742,7 @@ def _fetch_cinc2016_index(training_set: str, cache_dir: str,
     `[(record_name, label, quality), ...]`.
 
     Confirmed live against the installed data before writing this loader
-    (docs/heart_sounds_task.md Part 0): `REFERENCE.csv` is
+    (docs/heart_sounds_results.md Part 0): `REFERENCE.csv` is
     `record,label` with **label 1 = abnormal, -1 = normal** (cross-checked
     against the record's own `.hea` comment line, e.g. `# Abnormal`);
     `REFERENCE-SQI.csv` is `record,label,quality` with quality 0/1 (a
@@ -825,7 +825,7 @@ def load_cinc2016(
     """Stream PhysioNet/CinC Challenge 2016 heart-sound (PCG) recordings,
     windowed and labelled normal/abnormal.
 
-    Part 0 findings (docs/heart_sounds_task.md — verified against the live
+    Part 0 findings (docs/heart_sounds_results.md — verified against the live
     dataset before writing this loader, not assumed):
     - WFDB-native (`.hea`/`.dat`, also `.wav`), streams directly via
       `wfdb.rdrecord(record, pn_dir="challenge-2016/1.0.0/training-<set>")`
@@ -1232,7 +1232,7 @@ def load_vitaldb_ppg(
     'eia[data]'`) and network access.
 
     Field names verified against the installed `vitaldb` (1.5.8) library and
-    live API before writing this loader (see docs/vitaldb_ppg_hemorrhage_task.md
+    live API before writing this loader (see docs/vitaldb_ppg_results.md
     Part 0): clinical table via `load_clinical_data(caseids=list(range(1,6389)))`
     — note `caseids=[]` returns an EMPTY frame despite the docstring claiming
     "all cases", so every caseid must be listed explicitly — has an
@@ -1338,7 +1338,7 @@ def load_ppg_vitaldb(prefer_real: bool = True, require_real: bool = False,
                       **kwargs) -> PpgData:
     """Load VitalDB PPG, falling back to synthetic PPG on failure — mirrors
     `load_ppg`'s provenance contract exactly, but for VitalDB specifically
-    (kept separate from `load_ppg`/BIDMC per docs/vitaldb_ppg_hemorrhage_task.md:
+    (kept separate from `load_ppg`/BIDMC per docs/vitaldb_ppg_results.md:
     "keep BIDMC as a secondary dataset", not folded into the same fallback
     chain).
 
@@ -1374,7 +1374,7 @@ def load_ppg_vitaldb(prefer_real: bool = True, require_real: bool = False,
 
 # --------------------------------------------------------------------------- #
 # CRM — synthetic time-resolved Compensatory Reserve / occult-hemorrhage
-# generator (docs/synthetic_crm_task.md)
+# generator (docs/synthetic_crm_results.md)
 # --------------------------------------------------------------------------- #
 # Why this exists: VitalDB settled ~chance because one whole-CASE
 # `intraop_ebl` number was stamped on every window regardless of when in the
@@ -1385,7 +1385,7 @@ def load_ppg_vitaldb(prefer_real: bool = True, require_real: bool = False,
 # it is a genuine (if synthetic) test of whether the pipeline can track
 # time-varying occult volume loss, not just classify a fixed waveform shape.
 #
-# Physiological grounding (see docs/synthetic_crm_task.md and the
+# Physiological grounding (see docs/synthetic_crm_results.md and the
 # explainable-CRM paper, MDPI Bioengineering 2023, "An Explainable Machine
 # Learning Model for the Assessment of Compensatory Reserve"): as central
 # reserve `r` falls from 1.0 (normovolemic) toward 0.0 (decompensated),
@@ -1562,7 +1562,7 @@ def load_crm(prefer_real: bool = False, require_real: bool = False,
              **kwargs) -> CrmData:
     """Load the synthetic time-resolved CRM dataset. ALWAYS synthetic —
     there is no real loader: real LBNP/CRM-induction data is gated (request
-    access separately; see docs/synthetic_crm_task.md). Mirrors the other
+    access separately; see docs/synthetic_crm_results.md). Mirrors the other
     loaders' provenance-contract SHAPE for API consistency (`requested_real`
     recorded honestly, `require_real` raises rather than silently
     substituting), even though there is no real branch to fall back FROM.
@@ -1580,7 +1580,7 @@ def load_crm(prefer_real: bool = False, require_real: bool = False,
         raise RuntimeError(
             "--require-real: no real CRM/LBNP loader exists in this repo — "
             "real hypovolemia-induction data is gated (see "
-            "docs/synthetic_crm_task.md); refusing to pretend synthetic "
+            "docs/synthetic_crm_results.md); refusing to pretend synthetic "
             "data is real.")
     data = make_synthetic_crm(**kwargs)
     data.requested_real = prefer_real

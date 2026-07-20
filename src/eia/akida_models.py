@@ -17,7 +17,7 @@ sharing everything downstream (`quantize_and_convert`/`verify_against_sim`/
     image (bands x time), both axes real — see its docstring for why this
     needed a different first-layer shape than ECG's.
   - `build_akida_mi_model` (PTB-XL myocardial infarction — deepens ECG from
-    arrhythmia to MI, docs/ptbxl_mi_task.md): 12-lead ECG as a `(leads,
+    arrhythmia to MI, docs/ptbxl_mi_results.md): 12-lead ECG as a `(leads,
     time)` map, the same "genuinely 2-D" class as heart sounds', not a
     reuse of `build_akida_model` — MI needs spatial lead information a
     single-column reshape would destroy.
@@ -25,8 +25,7 @@ sharing everything downstream (`quantize_and_convert`/`verify_against_sim`/
 WHY A CONV2D-OVER-TIME, NOT A NATIVE CONV1D: Akida 2.0's layer catalog (see
 `docs/akida_ecg_results.md` Part 0) has no Conv1D — the closest fits are
 `Conv2D`/`DepthwiseConv2D` (spatial) or the newer `BufferTempConv`/
-`tenn_spatiotemporal` (genuinely temporal, TENN). Per
-`docs/akida_retarget_task.md`'s architecture fork, this first slice uses the
+`tenn_spatiotemporal` (genuinely temporal, TENN). This first slice uses the
 simplest mapping (quantized Conv2D-over-time, treating the 1-D window as a
 (window, 1, 1) single-column "image") and leaves TENN for later — TENN is the
 temporal-native alternative worth trying if this slice's fidelity is poor.

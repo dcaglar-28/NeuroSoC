@@ -1,6 +1,6 @@
 # Heart-sound (PCG) classification on PhysioNet/CinC 2016 — measured results
 
-Implements `docs/heart_sounds_task.md`. Heart sounds is the second real-data
+Heart sounds is the second real-data
 modality after ECG (EEG/CHB-MIT seizure detection was tried and retired —
 see `docs/eeg_seizure_results.md`, banner at top). Reported on its own, never
 pooled with ECG/PPG/EEG results.

@@ -1,9 +1,9 @@
 """Modality-agnostic windowed-signal feature front-end.
 
-Originally built for EEG seizure detection (docs/eeg_frontend_task.md,
+Originally built for EEG seizure detection (docs/eeg_frontend_results.md,
 retired 2026-07-13 — see docs/eeg_frontend_results.md), generalized here so
 the extraction machinery survives for the next modality that needs it
-(heart-sound murmur detection, docs/heart_sounds_task.md: raw delta-encoding
+(heart-sound murmur detection, docs/heart_sounds_results.md: raw delta-encoding
 came back ~chance, and a murmur is a spectral/turbulent-flow signature, not
 an edge, so a band-power front-end is the documented escalation). Domain-
 specific choices (which bands, which features) live with the caller

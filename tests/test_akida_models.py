@@ -1,4 +1,4 @@
-"""Offline unit tests for `eia.akida_models` (docs/akida_retarget_task.md).
+"""Offline unit tests for `eia.akida_models` (see docs/akida_ecg_results.md).
 
 `to_akida_input` is pure NumPy and always runs. Everything that touches the
 actual MetaTF toolchain (`build_akida_model`/`quantize_and_convert`/
@@ -151,7 +151,7 @@ def test_quantize_and_convert_qat_fine_tune_runs():
 
 
 def test_crm_reuses_build_akida_model_unchanged_end_to_end():
-    """CRM does NOT get its own builder (docs/synthetic_crm_task.md: reuse
+    """CRM does NOT get its own builder (docs/synthetic_crm_results.md: reuse
     the ECG waveform -> Akida CNN path, not heart's filterbank) -- this
     confirms `build_akida_model` (unmodified) converts and runs on the
     real `make_synthetic_crm` data shape, end to end."""

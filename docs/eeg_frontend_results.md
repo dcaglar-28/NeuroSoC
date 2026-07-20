@@ -5,7 +5,7 @@
 > paused pending a richer montage without the 16-input Xylo ceiling (Akida
 > headroom) and/or more patients. Recoverable from git history.
 
-Implements `docs/eeg_frontend_task.md`, the follow-up to the settled diagnosis
+The follow-up to the settled diagnosis
 in `docs/eeg_seizure_results.md`: subject-independent AND patient-specific
 splits were both ~chance, and critically the **float** model (no chip, no
 quantization) was at chance too — so the seizure signal was being destroyed

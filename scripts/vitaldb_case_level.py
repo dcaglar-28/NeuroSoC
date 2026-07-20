@@ -1,5 +1,5 @@
 """Case-level VitalDB hemorrhage classification — the matched-granularity
-rescue of the per-window result. See `docs/vitaldb_case_level_task.md` and
+rescue of the per-window result. See `docs/vitaldb_case_level_results.md` and
 `docs/vitaldb_ppg_results.md` (the ~chance per-window result this responds
 to): `intraop_ebl` is a single whole-case total stamped onto every window
 from that case, so a per-window prediction and a per-case label describe
@@ -196,7 +196,7 @@ def print_multiseed_summary(seed_results: list) -> None:
                "outside the seed band — a real, if modest and retrospective, "
                "case-level blood-loss signal in this PPG data.") if learned else (
         "~CHANCE: balanced acc and/or AUROC do not clearly clear 0.5 across "
-        "seeds. Per docs/vitaldb_case_level_task.md: this dataset's PPG does "
+        "seeds. Per docs/vitaldb_case_level_results.md: this dataset's PPG does "
         "not carry a usable blood-loss signal even at its label's own "
         "granularity. Do not chase this further — the honest next step for a "
         "flagship hemorrhage signal is LBNP (gated) or the synthetic "

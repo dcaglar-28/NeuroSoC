@@ -1,8 +1,8 @@
 # Akida ECG port — measured results (first slice)
 
-Implements the minimal first slice of `docs/akida_retarget_task.md`: install
-MetaTF, verify the toolchain, port ONE modality (ECG), and measure whether
-the on-chip fidelity gap shrinks vs. Xylo. Rockpool/XyloSim and every other
+Implements the minimal first slice of the Akida re-target: install MetaTF,
+verify the toolchain, port ONE modality (ECG), and measure whether the
+on-chip fidelity gap shrinks vs. Xylo. Rockpool/XyloSim and every other
 modality are untouched — this is a parallel deploy path, not a replacement.
 
 ## Outcome, stated up front
@@ -236,9 +236,8 @@ its gap reopens.
   (`FPGA_v2`, the SDK's current default), not the sub-mW Pico core this
   project actually committed to for the always-on biosignal cluster (see
   CLAUDE.md's hardware section). Pico re-characterization is unstarted.
-- **Not evidence about other modalities, TENN, on-chip learning, or
-  co-residence** — all explicitly out of scope for this minimal first
-  slice, per `docs/akida_retarget_task.md`.
+- **Not evidence about TENN, on-chip learning, or co-residence** — all
+  explicitly out of scope for this minimal first slice.
 
 ## Reproduce
 

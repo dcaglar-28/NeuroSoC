@@ -94,8 +94,8 @@ and `docs/akida_heart_results.md` for the full write-ups: Part-0 toolchain/
 fidelity findings, the confirmed Akida v2 layer constraints (heart sounds'
 genuinely-2-D bands x time filterbank map hit no NEW constraints beyond
 ECG's), and the measured float/Akida-sim numbers vs. the Xylo gap.
-Remaining scope from `docs/akida_retarget_task.md` (other modalities, TENN,
-on-chip-learning demo, co-residence re-eval) is not started.
+Remaining scope (TENN, on-chip-learning demo, co-residence re-eval) is not
+started.
 
 ## Xylo pipeline (Rockpool)
 - `src/eia/models.py` (snnTorch) = fast local research. `src/eia/rockpool_models.py`
@@ -296,7 +296,7 @@ Current state:
   **VitalDB** (`--ppg-source vitaldb`) is a real, if coarse, hemorrhage-relevant
   label: case-level `intraop_ebl >= 500 mL` (significant blood loss) from open
   intraoperative monitoring — see "VitalDB PPG hemorrhage dataset" below and
-  `docs/vitaldb_ppg_hemorrhage_task.md`. Neither is conscious-field-trauma
+  `docs/vitaldb_ppg_results.md`. Neither is conscious-field-trauma
   ground truth; the synthetic PPG generator is still closest in spirit to the
   actual target (reduced amplitude + blunted dicrotic notch, mirroring
   Compensatory Reserve waveform changes). See README "Notes on rigor".
@@ -346,8 +346,8 @@ Current state:
   a real step up in *label realism* over BIDMC's SpO2 proxy; it is not (yet)
   a step up in *per-window learnability* — case-level pooling or a graded EBL
   target are the follow-ups if this is revisited, not attempted here.
-- **Case-level rescue attempted (see docs/vitaldb_case_level_task.md /
-  docs/vitaldb_case_level_results.md): ALSO ~chance.** `intraop_ebl` is a
+- **Case-level rescue attempted (see docs/vitaldb_case_level_results.md):
+  ALSO ~chance.** `intraop_ebl` is a
   whole-case label, so the statistically honest use of it is one prediction
   per case (`scripts/vitaldb_case_level.py`: train the same per-window SNN
   unchanged, mean-pool its per-window output probabilities into one
@@ -380,9 +380,9 @@ open labels.
 - **C (Circulation) — DONE.** ECG arrhythmia on real MIT-BIH is the one modality
   genuinely learning on real data (float balanced acc 0.845). On-chip XyloSim
   fidelity (~0.56) is the open engineering gap, not a data gap.
-- **ECG deepened: arrhythmia -> myocardial infarction / ischemia
-  (docs/ptbxl_mi_task.md) — DONE, THIRD modality where the Akida fidelity
-  gap essentially closes.** Binary MI-vs-NORM on real PTB-XL (12-lead,
+- **ECG deepened: arrhythmia -> myocardial infarction / ischemia — DONE,
+  THIRD modality where the Akida fidelity gap essentially closes.** Binary
+  MI-vs-NORM on real PTB-XL (12-lead,
   cardiologist-labeled, ~21.8% MI of 11,601 confidently-labeled records) on
   the Akida path: float AUROC 0.890 +/- 0.024 (5 seeds) -- right at the
   literature's ~0.9+ benchmarked range for this exact task, genuine
@@ -454,11 +454,11 @@ open labels.
   from git history. Paused pending a richer montage without the 16-input Xylo
   ceiling (Akida headroom) and/or more patients — not attempted here since
   heart sounds was the higher-confidence path to a second genuinely-learning
-  modality (see `docs/heart_sounds_task.md`'s framing).
+  modality (see `docs/heart_sounds_results.md`'s framing).
 - **M (Massive hemorrhage) — synthetic time-resolved demo BUILT; real-data
   validation still pending gated LBNP.** VitalDB is settled ~chance (window +
   case level) because its label was whole-CASE, not time-aligned. Built
-  `datasets.make_synthetic_crm` (docs/synthetic_crm_task.md) to fix that BY
+  `datasets.make_synthetic_crm` to fix that BY
   CONSTRUCTION: a synthetic subject's PPG evolves along a reserve trajectory
   `r(t)` (1.0 -> 0.0), grounded in the explainable-CRM literature (`An
   Explainable ML Model for CRM`, MDPI Bioeng. 2023) — pulse amplitude falls,
