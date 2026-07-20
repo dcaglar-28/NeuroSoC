@@ -45,3 +45,8 @@ outputs/
 # Claude runtime
 .claude/*.lock
 .claude/scheduled_tasks.lock
+
+# Personal/strategic (not for the repo)
+EIA_2026_Mentor_Investor_Briefing.md
+EIA_Teammate_Shortlist.md
+cursor-prompt-eia-venture.md
