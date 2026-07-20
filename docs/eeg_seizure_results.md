@@ -31,10 +31,10 @@ timesteps) losing the seizure signature, not simply "too few patients." Two
 of five individual patients (chb02, chb03) showed a mild positive AUROC
 (~0.59-0.60) — not nothing, but not decisive either given n=5 seeds on n=2-3
 records per patient. **This local result is itself still data-constrained**
-(2-3 records/patient, most with only one seizure event) — see
-`notebooks/02_eeg_seizure.ipynb`, built to rerun this diagnostic at a larger
-scale on Colab's faster network before treating "front-end too lossy" as
-final.
+(2-3 records/patient, most with only one seizure event) — a larger Colab
+rerun of this diagnostic (before treating "front-end too lossy" as final) was
+planned but not completed; the notebook that would have run it was removed
+with the rest of the retired EEG code (recoverable from git history).
 
 **This is a different kind of negative result than VitalDB's**, and should
 not be read the same way. VitalDB's conclusion was "the label itself does not
@@ -285,27 +285,28 @@ base for "does more data within one patient help" — the two patients with
 the most seizure-record diversity (chb02, chb03: AUROC ~0.59-0.60) are also
 the ones showing the mildest positive signal, which is at least directionally
 consistent with "more within-patient data would help," not decisively
-against it. `notebooks/02_eeg_seizure.ipynb` is built to rerun this exact
-diagnostic with every available seizure record for these patients (CHB-MIT
-has 3-7 per subject) on a faster connection — that is the run to trust before
-treating "front-end too lossy" as the final answer over "still not enough
-data, even within-patient."
+against it. Rerunning this exact diagnostic with every available seizure
+record for these patients (CHB-MIT has 3-7 per subject) on a faster
+connection is the run to trust before treating "front-end too lossy" as the
+final answer over "still not enough data, even within-patient" — planned but
+not completed (see "Follow-ups" below).
 
 ## Follow-ups if this is revisited
 
-1. **Run `notebooks/02_eeg_seizure.ipynb` on Colab (do this first)**: pulls
-   every available seizure record for the 9 loadable subjects on a faster
-   connection, runs both splits on the same larger pool, and prints the
-   verdict — the most direct way to firm up "front-end too lossy" vs. "still
-   not enough data" from Part 2 above. Verified to run end-to-end locally at
-   reduced scale before being written up here.
-2. **If the notebook confirms front-end too lossy**: revisit
+1. **Rerun at Colab scale (do this first)**: pull every available seizure
+   record for the 9 loadable subjects on a faster connection, run both
+   splits on the same larger pool, and compare against the verdict above —
+   the most direct way to firm up "front-end too lossy" vs. "still not
+   enough data" from Part 2 above. The notebook that did this (verified to
+   run end-to-end locally at reduced scale) was removed with the rest of
+   the retired EEG code; recoverable from git history if this is revisited.
+2. **If that rerun confirms front-end too lossy**: revisit
    `datasets.EEG_MONTAGE` (try 8 channels — the exact Xylo ceiling), the
    band-pass range, or `resample_to` (try more than 128 timesteps, trading
    off against the ECG quantization-fidelity lesson that fewer timesteps
    usually helps on-chip agreement — worth an explicit sweep here, not
    assumed).
-3. **If the notebook confirms scale problem instead**: keep pulling more
+3. **If that rerun confirms scale problem instead**: keep pulling more
    subjects/records/subject (`--eeg-seizure-records`,
    `--eeg-nonseizure-records`, `--eeg-subjects`) — the `data/chbmit/` cache
    means this is incremental across sessions, not repeated download.
@@ -331,5 +332,5 @@ python scripts/xylo_verify.py --modality eeg --real --require-real \
   --epochs 20 --n-restarts 5 --n-seeds 5 --max-verify 300
 
 # both splits together, at Colab scale, with the explicit verdict:
-# notebooks/02_eeg_seizure.ipynb
+# the notebook that ran this was removed with the retired EEG code (git history)
 ```

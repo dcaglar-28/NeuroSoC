@@ -53,9 +53,9 @@ def run(real: bool = False, epochs: int = 10, hidden: int = 128,
     data = loader(prefer_real=real, require_real=require_real)
     card = report.data_card(data, verbose=False)
     # Guards the exact bug this repo hit once already: a data object loaded
-    # for one modality silently fed to training/reporting for another (see
-    # notebooks/01_ecg_snn.ipynb history). Cheap and always-on, not just in
-    # debug builds — this is a correctness invariant, not a bare `assert`.
+    # for one modality silently fed to training/reporting for another. Cheap
+    # and always-on, not just in debug builds — this is a correctness
+    # invariant, not a bare `assert`.
     report.assert_provenance(card, data, modality)
     print(f"[data] modality={modality}  source={data.source}  "
           f"provenance={card.provenance}  X={data.X.shape}  "

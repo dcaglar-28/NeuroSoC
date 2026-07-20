@@ -173,8 +173,8 @@ def train_modality(modality: str, real: bool, epochs: int, n_hidden: int,
                   **(loader_kwargs or {}))
     card = report.data_card(data, verbose=card_verbose)
     # Guards the exact bug this repo hit once already: a data object loaded
-    # for one modality silently fed to training/reporting for another (see
-    # notebooks/01_ecg_snn.ipynb history). Cheap and always-on.
+    # for one modality silently fed to training/reporting for another. Cheap
+    # and always-on.
     report.assert_provenance(card, data, modality)
     n_classes = int(np.asarray(data.y).max()) + 1
 

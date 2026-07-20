@@ -32,7 +32,8 @@ src/eia/
 scripts/
   xylo_verify.py      # trains the PPG net and verifies it on the XyloSim bit-precise simulator
 notebooks/
-  01_ecg_snn.ipynb   # thin: data card + waveform/encoding plots + train (local or Colab)
+  03_akida_ecg.ipynb  # thin: Akida ECG port, first slice (Linux/Colab only)
+  04_mvp_pitch.ipynb  # self-contained MVP pitch/validation notebook (numpy+matplotlib only)
 tests/          # unit tests for the numpy-only modules (run without torch)
 ```
 
@@ -210,24 +211,21 @@ viz.plot_waveforms(data)               # example windows per class
 viz.plot_encoding(data.X[0], threshold=0.2, fs=data.fs)   # the ON/OFF spike raster
 ```
 
-The notebook `notebooks/01_ecg_snn.ipynb` walks through all of this. To refresh
-its saved outputs (data card + plots + results) from the command line:
-
-```bash
-pip install jupyter
-jupyter nbconvert --to notebook --execute --inplace notebooks/01_ecg_snn.ipynb
-```
-
-Then commit/push so the Colab copy (which clones from GitHub) picks it up.
+This snippet is directly runnable (`python3` or a Jupyter kernel) — the current
+notebooks are `notebooks/03_akida_ecg.ipynb` (the live Akida ECG port; Linux/Colab
+only, see "Verify on Akida" below) and `notebooks/04_mvp_pitch.ipynb` (a
+self-contained pitch/validation walkthrough — numpy + matplotlib only, no repo
+clone needed).
 
 ## Local vs. Colab
 
-Develop locally — an M-series Mac runs this comfortably on the MPS GPU, with a
-faster edit/run loop than Colab. `notebooks/01_ecg_snn.ipynb` also runs on Colab
-(free GPU) as a fallback for heavier models; edit the `REPO` URL in its setup
-cell after you push to GitHub. Some spiking ops lack MPS kernels and fall back to
-CPU automatically — harmless at this scale; pass `--device cpu` if you hit an
-unsupported-op error.
+Develop locally — an M-series Mac runs `python -m eia.train` comfortably on the
+MPS GPU, with a faster edit/run loop than Colab. Some spiking ops lack MPS
+kernels and fall back to CPU automatically — harmless at this scale; pass
+`--device cpu` if you hit an unsupported-op error. The Akida path
+(`notebooks/03_akida_ecg.ipynb`, `scripts/akida_verify.py`) is Linux-only (no
+macOS wheel for `akida`, ever) — run it on Colab or the repo's Docker container,
+not locally on macOS.
 
 ## Push to GitHub
 
